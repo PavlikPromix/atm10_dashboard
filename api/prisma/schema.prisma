@@ -1,0 +1,97 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Device {
+  id            String    @id
+  name          String
+  tokenHash     String
+  scriptVersion String?
+  capabilities  Json?
+  lastSeenAt    DateTime?
+  online        Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  snapshots     Snapshot[]
+  commands      CommandQueue[]
+}
+
+model Snapshot {
+  id        String   @id @default(cuid())
+  deviceId  String
+  payload   Json
+  createdAt DateTime @default(now())
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+}
+
+model MetricPoint {
+  id        String   @id @default(cuid())
+  deviceId  String
+  metric    String
+  category  String?
+  value     Float
+  createdAt DateTime @default(now())
+
+  @@index([deviceId, metric, createdAt])
+}
+
+model AutocraftRule {
+  id        String   @id @default(cuid())
+  index     Int
+  label     String?
+  enabled   Boolean  @default(true)
+  source    String?
+  target    String?
+  payload   Json
+  updatedAt DateTime @updatedAt
+
+  @@unique([index])
+}
+
+model CommandQueue {
+  id          String    @id @default(cuid())
+  deviceId    String
+  action      String
+  payload     Json
+  status      String    @default("queued")
+  result      String?
+  requestedBy String?
+  createdAt   DateTime  @default(now())
+  sentAt      DateTime?
+  ackedAt     DateTime?
+  device      Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, status, createdAt])
+}
+
+model AlertEvent {
+  id        String   @id @default(cuid())
+  deviceId  String
+  severity  String
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([deviceId, createdAt])
+}
+
+model AppConfig {
+  key       String   @id
+  value     Json
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+}
