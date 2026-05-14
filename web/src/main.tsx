@@ -858,16 +858,104 @@ function App() {
     if (!ready) return;
     reload();
     const interval = window.setInterval(reload, 10000);
-    const ws = new WebSocket(eventsUrl());
-    ws.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      if (message.type === "snapshot" || message.type === "config" || message.type === "config_ack") reload();
+    let ws: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let pingTimer: number | null = null;
+    let reconnectAttempts = 0;
+    let disposed = false;
+
+    const setSafeStatus = (value: string) => {
+      if (!disposed) setStatus(value);
     };
-    ws.onopen = () => setStatus("live");
-    ws.onclose = () => setStatus("offline");
+
+    const stopPing = () => {
+      if (pingTimer !== null) {
+        window.clearInterval(pingTimer);
+        pingTimer = null;
+      }
+    };
+
+    const stopReconnectTimer = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    const closeSocket = () => {
+      if (!ws) return;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.close();
+      ws = null;
+    };
+
+    const scheduleReconnect = () => {
+      stopReconnectTimer();
+      const delay = Math.min(1000 * 2 ** Math.min(reconnectAttempts, 5), 12_000);
+      reconnectAttempts += 1;
+      reconnectTimer = window.setTimeout(connectSocket, delay);
+    };
+
+    const startPing = () => {
+      stopPing();
+      pingTimer = window.setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: "ping", at: Date.now() }));
+        } catch {
+          // Ignore ping errors; close handler will reconnect.
+        }
+      }, 8000);
+    };
+
+    const connectSocket = () => {
+      if (disposed) return;
+      stopReconnectTimer();
+      closeSocket();
+      stopPing();
+
+      setSafeStatus(reconnectAttempts > 0 ? "connecting" : "loading");
+      ws = new WebSocket(eventsUrl());
+
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "snapshot" || message.type === "config" || message.type === "config_ack") reload();
+        } catch {
+          // Ignore malformed websocket messages
+        }
+      };
+
+      ws.onopen = () => {
+        reconnectAttempts = 0;
+        setSafeStatus("live");
+        startPing();
+      };
+
+      ws.onclose = () => {
+        ws = null;
+        stopPing();
+        setSafeStatus("offline");
+        if (!disposed) scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        setSafeStatus("offline");
+        ws?.close();
+      };
+    };
+
+    connectSocket();
+
     return () => {
       window.clearInterval(interval);
-      ws.close();
+      disposed = true;
+      stopPing();
+      stopReconnectTimer();
+      closeSocket();
     };
   }, [ready]);
 

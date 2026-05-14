@@ -21,6 +21,7 @@ const env = {
   deviceName: process.env.DEVICE_NAME ?? "ATM10 Main",
   deviceToken: process.env.DEVICE_TOKEN ?? "change-me",
 };
+const LIVE_DEVICE_WINDOW_MS = 15_000;
 
 type ClientSocket = {
   send: (message: string) => void;
@@ -943,6 +944,7 @@ async function main() {
   });
 
   app.get("/api/dashboard/latest", { preHandler: authenticate }, async () => {
+    const now = new Date();
     const snapshot = await prisma.snapshot.findFirst({ orderBy: { createdAt: "desc" } });
     const devices = await prisma.device.findMany({ orderBy: { updatedAt: "desc" } });
     const config = await getRuntimeConfig();
@@ -953,7 +955,10 @@ async function main() {
         name: device.name,
         scriptVersion: device.scriptVersion,
         lastSeenAt: device.lastSeenAt,
-        online: device.online && deviceConnections.has(device.id),
+        online:
+          device.online &&
+          device.lastSeenAt !== null &&
+          now.getTime() - new Date(device.lastSeenAt).getTime() <= LIVE_DEVICE_WINDOW_MS,
       })),
       config,
     };
