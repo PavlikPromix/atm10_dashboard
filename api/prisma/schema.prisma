@@ -27,6 +27,9 @@ model Device {
   updatedAt     DateTime  @updatedAt
   snapshots     Snapshot[]
   commands      CommandQueue[]
+  resources     ResourceCurrent[]
+  resourceSamples ResourceSample[]
+  craftPatterns CraftPattern[]
 }
 
 model Snapshot {
@@ -48,6 +51,63 @@ model MetricPoint {
   createdAt DateTime @default(now())
 
   @@index([deviceId, metric, createdAt])
+}
+
+model ResourceCurrent {
+  id          String   @id @default(cuid())
+  deviceId    String
+  category    String
+  resourceKey String
+  name        String?
+  displayName String?
+  amount      Float
+  unit        String?
+  fingerprint String?
+  nbtHash     String?
+  craftable   Boolean  @default(false)
+  lastRate    Float?
+  payload     Json?
+  firstSeenAt DateTime @default(now())
+  lastChangedAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, category, resourceKey])
+  @@index([deviceId, category, amount])
+  @@index([deviceId, category, lastRate])
+  @@index([deviceId, category, displayName])
+}
+
+model ResourceSample {
+  id          String   @id @default(cuid())
+  deviceId    String
+  category    String
+  resourceKey String
+  amount      Float
+  createdAt   DateTime @default(now())
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, category, resourceKey, createdAt])
+  @@index([deviceId, category, createdAt])
+}
+
+model CraftPattern {
+  id           String   @id @default(cuid())
+  deviceId     String
+  category     String
+  resourceKey  String
+  outputName   String?
+  displayName  String?
+  outputAmount Float    @default(1)
+  ingredients  Json?
+  payload      Json
+  lastSeenAt   DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  device       Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, category, resourceKey])
+  @@index([deviceId, category, displayName])
 }
 
 model AutocraftRule {

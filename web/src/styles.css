@@ -391,6 +391,18 @@ header h2 {
   overflow: hidden;
 }
 
+.history-svg {
+  height: 290px;
+  margin-top: 0;
+}
+
+.grid-line {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.055);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
 .chart-area {
   fill: rgba(84, 214, 187, 0.14);
 }
@@ -412,6 +424,385 @@ header h2 {
 
 .chart-amber .chart-area {
   fill: rgba(255, 189, 102, 0.14);
+}
+
+.step-line {
+  stroke-width: 2;
+}
+
+.hover-line {
+  stroke: rgba(246, 250, 251, 0.45);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.hover-point {
+  fill: #f7fbfc;
+  stroke: #54d6bb;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.history-plot {
+  position: relative;
+  margin-top: 14px;
+}
+
+.axis-label,
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+}
+
+.axis-label {
+  right: 10px;
+  color: #8fa0aa;
+  font-size: 12px;
+}
+
+.axis-label.top {
+  top: 8px;
+}
+
+.axis-label.bottom {
+  bottom: 8px;
+}
+
+.chart-tooltip {
+  transform: translate(-50%, -112%);
+  min-width: 150px;
+  border: 1px solid rgba(137, 157, 170, 0.22);
+  border-radius: 7px;
+  background: rgba(8, 13, 17, 0.94);
+  padding: 8px 10px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34);
+  z-index: 2;
+}
+
+.chart-tooltip strong,
+.chart-tooltip span {
+  display: block;
+}
+
+.chart-tooltip span {
+  margin-top: 2px;
+  color: #8fa0aa;
+  font-size: 12px;
+}
+
+.empty-chart {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8fa0aa;
+  margin: 0;
+}
+
+.range-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid rgba(137, 157, 170, 0.16);
+  border-radius: 8px;
+  background: rgba(8, 13, 17, 0.46);
+}
+
+.range-tabs button {
+  min-height: 30px;
+  padding: 5px 9px;
+  border-color: transparent;
+  background: transparent;
+  color: #a8b7bf;
+}
+
+.range-tabs button.active {
+  border-color: rgba(84, 214, 187, 0.34);
+  background: rgba(84, 214, 187, 0.13);
+  color: #f6fafb;
+}
+
+.resource-workspace {
+  display: grid;
+  gap: 14px;
+}
+
+.resource-top-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.top-panel {
+  min-height: 260px;
+}
+
+.card-title span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.top-resource {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid rgba(137, 157, 170, 0.1);
+  padding: 6px 0;
+}
+
+.top-resource span,
+.resource-name strong,
+.resource-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.top-resource em,
+.resource-grid-row em {
+  color: #83e0b1;
+  font-style: normal;
+  font-size: 13px;
+}
+
+.top-resource em.negative,
+.resource-grid-row em.negative {
+  color: #ffabab;
+}
+
+.top-resource em.positive,
+.resource-grid-row em.positive {
+  color: #83e0b1;
+}
+
+.resource-main-grid {
+  display: grid;
+  grid-template-columns: minmax(520px, 1.1fr) minmax(420px, 0.9fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.resource-table-card,
+.history-card {
+  min-width: 0;
+}
+
+.search-box {
+  width: min(360px, 100%);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(137, 157, 170, 0.22);
+  border-radius: 7px;
+  background: rgba(8, 13, 17, 0.82);
+  padding: 0 10px;
+}
+
+.search-box input {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding-left: 0;
+}
+
+.resource-sort-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 14px 0;
+}
+
+.resource-sort-row button {
+  min-height: 32px;
+  padding: 5px 9px;
+}
+
+.resource-sort-row span {
+  color: #8fa0aa;
+  font-size: 12px;
+}
+
+.resource-table {
+  display: grid;
+  gap: 6px;
+  max-height: 62vh;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.resource-grid-row {
+  width: 100%;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) minmax(84px, auto) minmax(72px, auto) 64px;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  border-color: rgba(137, 157, 170, 0.12);
+  background: rgba(8, 13, 17, 0.35);
+}
+
+.resource-grid-row.selected {
+  border-color: rgba(84, 214, 187, 0.52);
+  background: rgba(84, 214, 187, 0.12);
+}
+
+.resource-grid-row.craftable {
+  box-shadow: inset 3px 0 0 rgba(255, 189, 102, 0.82);
+}
+
+.resource-name {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.resource-name small {
+  color: #8fa0aa;
+  font-size: 12px;
+}
+
+.resource-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(137, 157, 170, 0.18);
+  border-radius: 7px;
+  background: rgba(137, 157, 170, 0.1);
+  color: #f6fafb;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.resource-icon img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+
+.resource-icon.fluid {
+  color: #65a6ff;
+}
+
+.resource-icon.chemical {
+  color: #b887ff;
+}
+
+.craft-pill {
+  justify-self: end;
+  border: 1px solid rgba(255, 189, 102, 0.34);
+  border-radius: 999px;
+  color: #ffd18b;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.craft-drawer {
+  width: min(520px, 100%);
+  min-height: 100vh;
+  border-left: 1px solid rgba(137, 157, 170, 0.22);
+  background: rgba(12, 18, 23, 0.98);
+  padding: 22px;
+  overflow: auto;
+  box-shadow: -22px 0 60px rgba(0, 0, 0, 0.38);
+}
+
+.craft-drawer h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.craft-amount-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin: 20px 0;
+}
+
+.craft-section {
+  border-top: 1px solid rgba(137, 157, 170, 0.14);
+  padding-top: 16px;
+}
+
+.craft-section h3 {
+  margin: 0 0 10px;
+}
+
+.ingredient-row {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+  align-items: center;
+  border-top: 1px solid rgba(137, 157, 170, 0.1);
+  padding: 7px 0;
+}
+
+.ingredient-row span {
+  overflow-wrap: anywhere;
+}
+
+.ingredient-row em {
+  grid-column: 1 / -1;
+  color: #8fa0aa;
+  font-style: normal;
+  font-size: 12px;
+}
+
+.craft-submit {
+  width: 100%;
+  margin-top: 18px;
+}
+
+.error-state {
+  background: rgba(104, 43, 43, 0.28);
+  color: #ffabab;
+}
+
+.rule-editor input,
+.rule-editor label {
+  min-width: 0;
+}
+
+.editor-head > div,
+.toolbar > div {
+  min-width: 0;
+}
+
+.editor-head h3,
+.toolbar h2,
+.toolbar h3 {
+  overflow-wrap: anywhere;
+}
+
+.actions button {
+  white-space: nowrap;
+}
+
+.form-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.advanced-row {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .resource-row,
@@ -614,6 +1005,10 @@ label {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .resource-main-grid {
+    grid-template-columns: 1fr;
+  }
+
   .metric-card,
   .hero-chart,
   .resource-list,
@@ -646,6 +1041,7 @@ label {
   }
 
   .dashboard-grid,
+  .resource-top-grid,
   .autocraft-layout,
   .settings-grid,
   .form-grid,
@@ -665,6 +1061,21 @@ label {
     width: 100%;
     flex-wrap: wrap;
     justify-content: flex-start;
+  }
+
+  .resource-grid-row {
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+  }
+
+  .resource-grid-row em,
+  .resource-grid-row .craft-pill,
+  .resource-grid-row > .muted {
+    grid-column: 2 / -1;
+    justify-self: start;
+  }
+
+  .craft-amount-row {
+    grid-template-columns: 1fr;
   }
 
   .content {

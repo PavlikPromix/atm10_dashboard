@@ -53,8 +53,39 @@ const commandSchema = z.object({
     "delete_rule",
     "create_rule",
     "update_thresholds",
+    "craft_resource",
   ]),
   payload: z.record(z.any()).default({}),
+});
+
+const resourceQuerySchema = z.object({
+  deviceId: z.string().optional(),
+  category: z.string().optional(),
+  q: z.string().optional(),
+  sort: z.enum(["amount", "rate", "name"]).optional(),
+  order: z.enum(["asc", "desc"]).optional(),
+  limit: z.coerce.number().int().positive().max(1000).optional(),
+});
+
+const resourceHistoryQuerySchema = z.object({
+  deviceId: z.string().optional(),
+  category: z.string(),
+  key: z.string(),
+  range: z.string().optional(),
+});
+
+const craftPreviewQuerySchema = z.object({
+  deviceId: z.string().optional(),
+  category: z.string(),
+  key: z.string(),
+  amount: z.coerce.number().positive().optional(),
+});
+
+const craftResourceSchema = z.object({
+  deviceId: z.string().default(env.deviceId),
+  category: z.string(),
+  key: z.string(),
+  amount: z.number().positive(),
 });
 
 const configSchema = z.object({
@@ -131,13 +162,151 @@ function asArray(value: unknown): any[] {
   return Object.values(value);
 }
 
+const RESOURCE_CATEGORIES = ["Item", "Fluid", "Chemical"] as const;
+type ResourceCategory = (typeof RESOURCE_CATEGORIES)[number];
+
+const categoryMeta: Record<ResourceCategory, { unit: string; craftAction: string }> = {
+  Item: { unit: "items", craftAction: "craftItem" },
+  Fluid: { unit: "mB", craftAction: "craftFluid" },
+  Chemical: { unit: "mB", craftAction: "craftChemical" },
+};
+
+type NormalizedResource = {
+  category: ResourceCategory;
+  resourceKey: string;
+  name: string | null;
+  displayName: string | null;
+  amount: number;
+  unit: string;
+  fingerprint: string | null;
+  nbtHash: string | null;
+  payload: Record<string, unknown>;
+  craftable: boolean;
+};
+
+function normalizeCategory(value: unknown): ResourceCategory | null {
+  const text = String(value ?? "");
+  return RESOURCE_CATEGORIES.find((category) => category.toLowerCase() === text.toLowerCase()) ?? null;
+}
+
+function scalarString(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return String(value);
+  return null;
+}
+
+function resourceAmount(value: any): number {
+  const amount = Number(value?.amount ?? value?.count ?? value?.size ?? value?.quantity ?? value?.qty ?? value?.stored ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function resourceName(value: any): string | null {
+  return scalarString(value?.name ?? value?.id ?? value?.fluid ?? value?.chemical ?? value?.resource ?? value?.item);
+}
+
+function resourceLabel(value: any, fallback: string | null): string | null {
+  return scalarString(value?.displayName ?? value?.label ?? value?.name ?? value?.id ?? fallback);
+}
+
+function resourceVariant(value: any): { fingerprint: string | null; nbtHash: string | null } {
+  const fingerprint = scalarString(value?.fingerprint ?? value?.fingerPrint);
+  const nbtHash = scalarString(value?.nbtHash ?? value?.nbt ?? value?.damage ?? value?.metadata);
+  return { fingerprint, nbtHash };
+}
+
+function makeResourceKey(name: string | null, fingerprint: string | null, nbtHash: string | null, fallback: string): string {
+  const base = name ?? fallback;
+  const variant = fingerprint ?? nbtHash;
+  return variant ? `${base}#${variant}` : base;
+}
+
+function normalizeResourceEntry(entry: any, category: ResourceCategory, unitOverride?: string, craftable = false): NormalizedResource | null {
+  if (!entry || typeof entry !== "object") return null;
+  const name = resourceName(entry);
+  const { fingerprint, nbtHash } = resourceVariant(entry);
+  const displayName = resourceLabel(entry, name);
+  const fallback = displayName ?? category.toLowerCase();
+  const resourceKey = scalarString(entry.key ?? entry.resourceKey) ?? makeResourceKey(name, fingerprint, nbtHash, fallback);
+  const amount = resourceAmount(entry);
+  const unit = scalarString(entry.unit) ?? unitOverride ?? categoryMeta[category].unit;
+
+  return {
+    category,
+    resourceKey,
+    name,
+    displayName,
+    amount,
+    unit,
+    fingerprint,
+    nbtHash,
+    payload: entry,
+    craftable,
+  };
+}
+
+function normalizeResourceList(list: unknown, category: ResourceCategory, unitOverride?: string, craftable = false): NormalizedResource[] {
+  const byKey = new Map<string, NormalizedResource>();
+
+  for (const item of asArray(list)) {
+    const normalized = normalizeResourceEntry(item, category, unitOverride, craftable);
+    if (!normalized) continue;
+
+    const existing = byKey.get(normalized.resourceKey);
+    if (existing) {
+      existing.amount += normalized.amount;
+      existing.craftable = existing.craftable || normalized.craftable;
+      if (!existing.displayName && normalized.displayName) existing.displayName = normalized.displayName;
+    } else {
+      byKey.set(normalized.resourceKey, normalized);
+    }
+  }
+
+  return [...byKey.values()];
+}
+
+function resourceWhere(deviceId: string, category: string, resourceKey: string) {
+  return {
+    deviceId_category_resourceKey: {
+      deviceId,
+      category,
+      resourceKey,
+    },
+  };
+}
+
+function stripHeavySnapshotFields(snapshot: any) {
+  const cloned = normalizeSnapshot(snapshot);
+  for (const storage of cloned.storages ?? []) {
+    if (storage && typeof storage === "object") {
+      delete storage.list;
+      delete storage.resources;
+      delete storage.craftables;
+      delete storage._hasResourceList;
+    }
+  }
+  delete cloned.craftables;
+  delete cloned.patterns;
+  delete cloned.craftPatterns;
+  return cloned;
+}
+
 function normalizeSnapshot(snapshot: any) {
   if (!snapshot || typeof snapshot !== "object") return {};
 
   return {
     ...snapshot,
-    storages: asArray(snapshot.storages),
+    storages: asArray(snapshot.storages).map((storage) => {
+      const source = storage && typeof storage === "object" ? storage : {};
+      return {
+        ...source,
+        _hasResourceList: Object.prototype.hasOwnProperty.call(source, "resources") || Object.prototype.hasOwnProperty.call(source, "list"),
+        resources: asArray((source as any).resources ?? (source as any).list),
+        craftables: asArray((source as any).craftables),
+      };
+    }),
     alerts: asArray(snapshot.alerts),
+    patterns: asArray(snapshot.patterns ?? snapshot.craftPatterns),
     autocraft: snapshot.autocraft
       ? {
           ...snapshot.autocraft,
@@ -239,6 +408,7 @@ async function authenticate(request: FastifyRequest, reply: FastifyReply) {
 function getRangeStart(range: string) {
   const now = Date.now();
   const ranges: Record<string, number> = {
+    "5m": 5 * 60 * 1000,
     "1h": 60 * 60 * 1000,
     "24h": 24 * 60 * 60 * 1000,
     "7d": 7 * 24 * 60 * 60 * 1000,
@@ -254,21 +424,404 @@ async function pruneOldData() {
 
   await prisma.snapshot.deleteMany({ where: { createdAt: { lt: rawCutoff } } });
   await prisma.metricPoint.deleteMany({ where: { createdAt: { lt: historyCutoff } } });
+  await prisma.resourceSample.deleteMany({ where: { createdAt: { lt: historyCutoff } } });
   await prisma.alertEvent.deleteMany({ where: { createdAt: { lt: historyCutoff } } });
+}
+
+function getCraftableLists(snapshot: any, category: ResourceCategory, storage: any) {
+  const craftables = snapshot?.craftables;
+  const byCategory = craftables?.[category] ?? craftables?.[category.toLowerCase()] ?? craftables?.[`${category.toLowerCase()}s`];
+  return normalizeResourceList(storage?.craftables?.length ? storage.craftables : byCategory, category, storage?.unit, true);
+}
+
+function extractPatternOutput(pattern: any, fallbackCategory?: ResourceCategory): NormalizedResource | null {
+  if (!pattern || typeof pattern !== "object") return null;
+  const category = normalizeCategory(pattern.category ?? pattern.categoryKey ?? fallbackCategory ?? "Item") ?? "Item";
+  const output = pattern.output ?? pattern.result ?? pattern.outputs?.[1] ?? pattern.outputs?.[0] ?? pattern;
+  return normalizeResourceEntry(output, category, pattern.unit, true);
+}
+
+function extractPatternIngredients(pattern: any) {
+  const sources = [
+    pattern?.ingredients,
+    pattern?.inputs,
+    pattern?.input,
+    pattern?.pattern?.ingredients,
+    pattern?.pattern?.inputs,
+  ];
+
+  for (const source of sources) {
+    const values = asArray(source)
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return null;
+        const category = normalizeCategory((entry as any).category ?? (entry as any).categoryKey ?? "Item") ?? "Item";
+        const normalized = normalizeResourceEntry(entry, category);
+        if (!normalized) return null;
+        return {
+          category: normalized.category,
+          key: normalized.resourceKey,
+          name: normalized.name,
+          displayName: normalized.displayName,
+          amount: normalized.amount || 1,
+          unit: normalized.unit,
+        };
+      })
+      .filter(Boolean);
+
+    if (values.length) return values;
+  }
+
+  return null;
+}
+
+async function syncCraftPatterns(deviceId: string, snapshot: any, now: Date) {
+  const patterns = asArray(snapshot?.patterns ?? snapshot?.craftPatterns);
+  const operations: any[] = [];
+
+  for (const pattern of patterns) {
+    const output = extractPatternOutput(pattern);
+    if (!output) continue;
+
+    operations.push(
+      prisma.craftPattern.upsert({
+        where: resourceWhere(deviceId, output.category, output.resourceKey),
+        create: {
+          deviceId,
+          category: output.category,
+          resourceKey: output.resourceKey,
+          outputName: output.name,
+          displayName: output.displayName,
+          outputAmount: output.amount > 0 ? output.amount : 1,
+          ingredients: extractPatternIngredients(pattern) as any,
+          payload: pattern,
+          lastSeenAt: now,
+        },
+        update: {
+          outputName: output.name,
+          displayName: output.displayName,
+          outputAmount: output.amount > 0 ? output.amount : 1,
+          ingredients: extractPatternIngredients(pattern) as any,
+          payload: pattern,
+          lastSeenAt: now,
+        },
+      }),
+    );
+  }
+
+  if (operations.length) await prisma.$transaction(operations);
+}
+
+async function persistResourceRows(deviceId: string, rows: NormalizedResource[], categoriesWithLists: Set<ResourceCategory>, now: Date) {
+  const categories = [...new Set([...categoriesWithLists, ...rows.map((row) => row.category)])];
+  if (!categories.length) return;
+
+  const existingRows = await prisma.resourceCurrent.findMany({
+    where: {
+      deviceId,
+      category: { in: categories },
+    },
+  });
+  const existingByKey = new Map(existingRows.map((row) => [`${row.category}:${row.resourceKey}`, row]));
+  const nextByKey = new Map<string, NormalizedResource>();
+
+  for (const row of rows) {
+    const key = `${row.category}:${row.resourceKey}`;
+    const existing = nextByKey.get(key);
+    if (existing) {
+      existing.amount += row.amount;
+      existing.craftable = existing.craftable || row.craftable;
+    } else {
+      nextByKey.set(key, { ...row });
+    }
+  }
+
+  for (const existing of existingRows) {
+    const existingCategory = normalizeCategory(existing.category);
+    if (!existingCategory || !categoriesWithLists.has(existingCategory)) continue;
+
+    const key = `${existing.category}:${existing.resourceKey}`;
+    if (!nextByKey.has(key) && existing.amount !== 0) {
+      nextByKey.set(key, {
+        category: existingCategory,
+        resourceKey: existing.resourceKey,
+        name: existing.name,
+        displayName: existing.displayName,
+        amount: 0,
+        unit: existing.unit ?? categoryMeta[existingCategory].unit,
+        fingerprint: existing.fingerprint,
+        nbtHash: existing.nbtHash,
+        payload: (existing.payload as Record<string, unknown>) ?? {},
+        craftable: existing.craftable,
+      });
+    }
+  }
+
+  const operations: any[] = [];
+  const samples: Array<{ deviceId: string; category: string; resourceKey: string; amount: number; createdAt: Date }> = [];
+
+  for (const row of nextByKey.values()) {
+    const existing = existingByKey.get(`${row.category}:${row.resourceKey}`);
+    const amountChanged = !existing || Math.abs(existing.amount - row.amount) > 0.000001;
+    const seconds = existing ? Math.max((now.getTime() - existing.lastChangedAt.getTime()) / 1000, 1) : 1;
+    const lastRate = amountChanged && existing ? (row.amount - existing.amount) / seconds : existing?.lastRate ?? 0;
+
+    if (amountChanged) {
+      samples.push({
+        deviceId,
+        category: row.category,
+        resourceKey: row.resourceKey,
+        amount: row.amount,
+        createdAt: now,
+      });
+    }
+
+    operations.push(
+      prisma.resourceCurrent.upsert({
+        where: resourceWhere(deviceId, row.category, row.resourceKey),
+        create: {
+          deviceId,
+          category: row.category,
+          resourceKey: row.resourceKey,
+          name: row.name,
+          displayName: row.displayName,
+          amount: row.amount,
+          unit: row.unit,
+          fingerprint: row.fingerprint,
+          nbtHash: row.nbtHash,
+          craftable: row.craftable,
+          lastRate,
+          payload: row.payload as any,
+          firstSeenAt: now,
+          lastChangedAt: now,
+          lastSeenAt: now,
+        },
+        update: {
+          name: row.name,
+          displayName: row.displayName,
+          amount: row.amount,
+          unit: row.unit,
+          fingerprint: row.fingerprint,
+          nbtHash: row.nbtHash,
+          craftable: row.craftable,
+          lastRate,
+          payload: row.payload as any,
+          lastChangedAt: amountChanged ? now : existing?.lastChangedAt,
+          lastSeenAt: now,
+        },
+      }),
+    );
+  }
+
+  if (samples.length) {
+    operations.push(prisma.resourceSample.createMany({ data: samples }));
+  }
+
+  if (operations.length) await prisma.$transaction(operations);
+}
+
+async function persistResourcesFromSnapshot(deviceId: string, snapshot: any, now: Date) {
+  const rows: NormalizedResource[] = [];
+  const categoriesWithLists = new Set<ResourceCategory>();
+
+  for (const storage of snapshot.storages ?? []) {
+    const category = normalizeCategory(storage?.key);
+    if (!category) continue;
+
+    if (storage._hasResourceList) {
+      categoriesWithLists.add(category);
+      rows.push(...normalizeResourceList(storage.resources, category, storage.unit));
+    }
+
+    const craftables = getCraftableLists(snapshot, category, storage);
+    if (craftables.length) {
+      categoriesWithLists.add(category);
+      rows.push(...craftables);
+    }
+  }
+
+  await persistResourceRows(deviceId, rows, categoriesWithLists, now);
+  await syncCraftPatterns(deviceId, snapshot, now);
+}
+
+function publicResource(row: any, pattern?: any) {
+  return {
+    id: row.id,
+    deviceId: row.deviceId,
+    category: row.category,
+    key: row.resourceKey,
+    name: row.name,
+    displayName: row.displayName,
+    amount: row.amount,
+    unit: row.unit,
+    fingerprint: row.fingerprint,
+    nbtHash: row.nbtHash,
+    craftable: row.craftable || Boolean(pattern),
+    lastRate: row.lastRate,
+    firstSeenAt: row.firstSeenAt,
+    lastChangedAt: row.lastChangedAt,
+    lastSeenAt: row.lastSeenAt,
+    pattern: pattern
+      ? {
+          outputAmount: pattern.outputAmount,
+          ingredients: pattern.ingredients,
+          updatedAt: pattern.updatedAt,
+        }
+      : null,
+  };
+}
+
+function numericRuleValue(rule: any, key: string, fallback?: number) {
+  const value = Number(rule?.[key] ?? fallback);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function calcRuleReserve(rule: any, config: any, sourceAmount: number) {
+  const fixedReserve = numericRuleValue(rule, "fixedReserve", numericRuleValue(rule, "keepSource"));
+  if (fixedReserve !== undefined) return Math.max(0, Math.min(fixedReserve, sourceAmount));
+
+  const reservePercent = numericRuleValue(rule, "reservePercent", numericRuleValue(config, "reservePercent", 0)) ?? 0;
+  const reserveMin = numericRuleValue(rule, "reserveMin", numericRuleValue(config, "reserveMin", 0)) ?? 0;
+  const reserveMax = numericRuleValue(rule, "reserveMax", numericRuleValue(config, "reserveMax", sourceAmount)) ?? sourceAmount;
+  return Math.max(0, Math.min(Math.max(Math.round(sourceAmount * reservePercent), reserveMin), reserveMax, sourceAmount));
+}
+
+function findAutocraftRule(config: any, resource: any) {
+  const rules = config?.rules ?? config?.autocraft?.rules;
+  if (!Array.isArray(rules)) return null;
+  return (
+    rules.find((rule) => {
+      const target = scalarString(rule?.target);
+      return target && (target === resource.name || target === resource.resourceKey);
+    }) ?? null
+  );
+}
+
+async function findResourceByName(deviceId: string, category: ResourceCategory, name: string) {
+  return prisma.resourceCurrent.findFirst({
+    where: {
+      deviceId,
+      category,
+      OR: [{ resourceKey: name }, { name }],
+    },
+  });
+}
+
+function normalizeIngredientRows(ingredients: any, outputAmount = 1) {
+  return asArray(ingredients)
+    .map((ingredient) => {
+      if (!ingredient || typeof ingredient !== "object") return null;
+      const category = normalizeCategory(ingredient.category ?? ingredient.categoryKey ?? "Item") ?? "Item";
+      const key = scalarString(ingredient.key ?? ingredient.resourceKey) ?? makeResourceKey(resourceName(ingredient), null, null, "ingredient");
+      return {
+        category,
+        key,
+        name: resourceName(ingredient),
+        displayName: resourceLabel(ingredient, resourceName(ingredient)),
+        amount: Number(ingredient.amount || 1) / Math.max(outputAmount, 1),
+        unit: scalarString(ingredient.unit) ?? categoryMeta[category].unit,
+      };
+    })
+    .filter(Boolean) as Array<{ category: ResourceCategory; key: string; name: string | null; displayName: string | null; amount: number; unit: string }>;
+}
+
+async function buildCraftPreview(deviceId: string, category: ResourceCategory, key: string, requestedAmount = 1) {
+  const resource = await prisma.resourceCurrent.findUnique({
+    where: resourceWhere(deviceId, category, key),
+  });
+  if (!resource) return null;
+
+  const pattern = await prisma.craftPattern.findUnique({
+    where: resourceWhere(deviceId, category, key),
+  });
+
+  const runtime = await getRuntimeConfig();
+  const autocraft = (runtime.value as any)?.autocraft ?? {};
+  const rule = findAutocraftRule(autocraft, resource);
+
+  if (rule?.source) {
+    const source = await findResourceByName(deviceId, "Item", String(rule.source));
+    const sourceAmount = Number(source?.amount ?? 0);
+    const reserve = calcRuleReserve(rule, autocraft, sourceAmount);
+    const sourcePerCraft = numericRuleValue(rule, "sourcePerCraft", numericRuleValue(rule, "sourcePerOutput", 1)) ?? 1;
+    const outputPerCraft = numericRuleValue(rule, "outputPerCraft", 1) ?? 1;
+    const maxBatches = Math.max(Math.floor((sourceAmount - reserve) / Math.max(sourcePerCraft, 1)), 0);
+    let maxAmount = maxBatches * Math.max(outputPerCraft, 1);
+    const maxOutputs = numericRuleValue(rule, "maxOutputsPerJob", numericRuleValue(autocraft, "maxOutputsPerJob"));
+    if (maxOutputs && maxOutputs > 0) maxAmount = Math.min(maxAmount, maxOutputs);
+    if (rule.targetLimit) maxAmount = Math.min(maxAmount, Math.max(Number(rule.targetLimit) - resource.amount, 0));
+    const batches = Math.ceil(requestedAmount / Math.max(outputPerCraft, 1));
+
+    return {
+      resource: publicResource(resource, pattern),
+      mode: "rule",
+      craftable: true,
+      maxAmount,
+      requestedAmount,
+      ingredients: [
+        {
+          category: "Item",
+          key: String(rule.source),
+          name: String(rule.source),
+          displayName: source?.displayName ?? String(rule.source),
+          amount: batches * sourcePerCraft,
+          available: sourceAmount,
+          reserve,
+          unit: source?.unit ?? "items",
+        },
+      ],
+      patternAvailable: Boolean(pattern),
+      warnings: [],
+    };
+  }
+
+  const outputAmount = Number(pattern?.outputAmount ?? 1) || 1;
+  const ingredients = normalizeIngredientRows(pattern?.ingredients, outputAmount);
+  let maxAmount: number | null = null;
+
+  if (ingredients.length) {
+    const limits = [];
+    for (const ingredient of ingredients) {
+      const current = await prisma.resourceCurrent.findFirst({
+        where: {
+          deviceId,
+          category: ingredient.category,
+          OR: [{ resourceKey: ingredient.key }, { name: ingredient.name ?? ingredient.key }],
+        },
+      });
+      const available = Number(current?.amount ?? 0);
+      (ingredient as any).available = available;
+      limits.push(Math.floor(available / Math.max(ingredient.amount, 0.000001)));
+    }
+    maxAmount = Math.max(0, Math.min(...limits));
+  }
+
+  return {
+    resource: publicResource(resource, pattern),
+    mode: pattern ? "pattern" : "direct",
+    craftable: resource.craftable || Boolean(pattern),
+    maxAmount,
+    requestedAmount,
+    ingredients: ingredients.length ? ingredients.map((ingredient) => ({ ...ingredient, amount: ingredient.amount * requestedAmount })) : null,
+    patternAvailable: Boolean(pattern),
+    warnings: ingredients.length ? [] : ["ingredients unavailable from bridge pattern data"],
+  };
 }
 
 async function persistSnapshot(deviceId: string, snapshot: any) {
   const normalizedSnapshot = normalizeSnapshot(snapshot);
+  const now = new Date();
 
   await prisma.device.update({
     where: { id: deviceId },
-    data: { lastSeenAt: new Date(), online: true },
+    data: { lastSeenAt: now, online: true },
   });
+
+  await persistResourcesFromSnapshot(deviceId, normalizedSnapshot, now);
 
   await prisma.snapshot.create({
     data: {
       deviceId,
-      payload: normalizedSnapshot,
+      payload: stripHeavySnapshotFields(normalizedSnapshot),
     },
   });
 
@@ -307,7 +860,7 @@ async function persistSnapshot(deviceId: string, snapshot: any) {
     }
   }
 
-  broadcast("snapshot", { deviceId, snapshot: normalizedSnapshot });
+  broadcast("snapshot", { deviceId, snapshot: stripHeavySnapshotFields(normalizedSnapshot) });
 }
 
 async function sendPendingCommands(deviceId: string) {
@@ -422,6 +975,162 @@ async function main() {
     });
 
     return { points };
+  });
+
+  app.get("/api/resources", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = resourceQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+
+    const category = parsed.data.category ? normalizeCategory(parsed.data.category) : null;
+    if (parsed.data.category && !category) return reply.code(400).send({ error: "invalid category" });
+
+    const sort = parsed.data.sort ?? "amount";
+    const order = parsed.data.order ?? "desc";
+    const limit = parsed.data.limit ?? 500;
+    const where: any = {
+      deviceId: parsed.data.deviceId ?? env.deviceId,
+    };
+    if (category) where.category = category;
+    if (parsed.data.q?.trim()) {
+      const contains = parsed.data.q.trim();
+      where.OR = [
+        { resourceKey: { contains, mode: "insensitive" } },
+        { name: { contains, mode: "insensitive" } },
+        { displayName: { contains, mode: "insensitive" } },
+      ];
+    }
+
+    const orderBy =
+      sort === "rate"
+        ? { lastRate: order }
+        : sort === "name"
+          ? { displayName: order }
+          : { amount: order };
+
+    const resources = await prisma.resourceCurrent.findMany({
+      where,
+      orderBy,
+      take: limit,
+    });
+
+    const patterns = await prisma.craftPattern.findMany({
+      where: {
+        deviceId: where.deviceId,
+        category: category ? category : undefined,
+        resourceKey: { in: resources.map((resource) => resource.resourceKey) },
+      },
+    });
+    const patternByKey = new Map(patterns.map((pattern) => [`${pattern.category}:${pattern.resourceKey}`, pattern]));
+
+    return {
+      resources: resources.map((resource) => publicResource(resource, patternByKey.get(`${resource.category}:${resource.resourceKey}`))),
+    };
+  });
+
+  app.get("/api/resources/top", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = resourceQuerySchema.extend({ kind: z.enum(["amount", "growth", "decline"]).optional() }).safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+
+    const category = parsed.data.category ? normalizeCategory(parsed.data.category) : null;
+    if (parsed.data.category && !category) return reply.code(400).send({ error: "invalid category" });
+
+    const kind = parsed.data.kind ?? "amount";
+    const where: any = { deviceId: parsed.data.deviceId ?? env.deviceId };
+    if (category) where.category = category;
+    if (kind === "growth") where.lastRate = { gt: 0 };
+    if (kind === "decline") where.lastRate = { lt: 0 };
+
+    const resources = await prisma.resourceCurrent.findMany({
+      where,
+      orderBy: kind === "growth" ? { lastRate: "desc" } : kind === "decline" ? { lastRate: "asc" } : { amount: "desc" },
+      take: parsed.data.limit ?? 12,
+    });
+
+    return { resources: resources.map((resource) => publicResource(resource)) };
+  });
+
+  app.get("/api/resources/history", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = resourceHistoryQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+
+    const category = normalizeCategory(parsed.data.category);
+    if (!category) return reply.code(400).send({ error: "invalid category" });
+
+    const deviceId = parsed.data.deviceId ?? env.deviceId;
+    const start = getRangeStart(parsed.data.range ?? "1h");
+    const where = {
+      deviceId,
+      category,
+      resourceKey: parsed.data.key,
+    };
+    const [previous, points, current] = await Promise.all([
+      prisma.resourceSample.findFirst({
+        where: { ...where, createdAt: { lt: start } },
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.resourceSample.findMany({
+        where: { ...where, createdAt: { gte: start } },
+        orderBy: { createdAt: "asc" },
+        take: 5000,
+      }),
+      prisma.resourceCurrent.findUnique({ where: resourceWhere(deviceId, category, parsed.data.key) }),
+    ]);
+
+    const result = previous ? [previous, ...points] : points;
+    if (result.length === 0 && current) {
+      result.push({ id: current.id, deviceId, category, resourceKey: current.resourceKey, amount: current.amount, createdAt: current.lastSeenAt } as any);
+    }
+
+    return {
+      points: result.map((point) => ({ createdAt: point.createdAt, value: point.amount })),
+      resource: current ? publicResource(current) : null,
+    };
+  });
+
+  app.get("/api/resources/craft-preview", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = craftPreviewQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid query", issues: parsed.error.issues });
+
+    const category = normalizeCategory(parsed.data.category);
+    if (!category) return reply.code(400).send({ error: "invalid category" });
+
+    const preview = await buildCraftPreview(parsed.data.deviceId ?? env.deviceId, category, parsed.data.key, parsed.data.amount ?? 1);
+    if (!preview) return reply.code(404).send({ error: "resource not found" });
+    return preview;
+  });
+
+  app.post("/api/resources/craft", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = craftResourceSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid craft request", issues: parsed.error.issues });
+
+    const category = normalizeCategory(parsed.data.category);
+    if (!category) return reply.code(400).send({ error: "invalid category" });
+
+    const preview = await buildCraftPreview(parsed.data.deviceId, category, parsed.data.key, parsed.data.amount);
+    if (!preview) return reply.code(404).send({ error: "resource not found" });
+    if (!preview.craftable) return reply.code(400).send({ error: "resource is not craftable" });
+    if (preview.maxAmount !== null && parsed.data.amount > preview.maxAmount) {
+      return reply.code(400).send({ error: "requested amount exceeds direct max", maxAmount: preview.maxAmount });
+    }
+
+    const command = await prisma.commandQueue.create({
+      data: {
+        deviceId: parsed.data.deviceId,
+        action: "craft_resource",
+        payload: {
+          category,
+          key: parsed.data.key,
+          name: preview.resource.name,
+          fingerprint: preview.resource.fingerprint,
+          nbtHash: preview.resource.nbtHash,
+          amount: parsed.data.amount,
+        },
+        requestedBy: (request.user as any)?.username,
+      },
+    });
+
+    await sendPendingCommands(parsed.data.deviceId);
+    return command;
   });
 
   app.get("/api/config", { preHandler: authenticate }, async () => getRuntimeConfig());

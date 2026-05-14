@@ -20,6 +20,7 @@ local CONFIG = {
         token = "change-me",
         reconnectSeconds = 10,
         sendSnapshots = true,
+        craftableRefreshSeconds = 15,
         configPath = "atm10_dashboard_config.json",
         scriptVersion = "2.0.0",
     },
@@ -443,6 +444,8 @@ local RESOURCE_TYPES = {
         unit = "items",
         listNew = "getItems",
         listOld = "listItems",
+        craftableList = "getCraftableItems",
+        craftMethod = "craftItem",
         legacyMax = "getMaxItemDiskStorage",
     },
     {
@@ -451,6 +454,8 @@ local RESOURCE_TYPES = {
         unit = "mB",
         listNew = "getFluids",
         listOld = "listFluids",
+        craftableList = "getCraftableFluids",
+        craftMethod = "craftFluid",
         legacyMax = "getMaxFluidDiskStorage",
     },
     {
@@ -459,6 +464,8 @@ local RESOURCE_TYPES = {
         unit = "mB",
         listNew = "getChemicals",
         listOld = nil,
+        craftableList = "getCraftableChemicals",
+        craftMethod = "craftChemical",
         legacyMax = nil,
     },
 }
@@ -744,6 +751,17 @@ local WEB = {
     configVersion = nil,
 }
 
+local CRAFT_CACHE = {
+    lastRefreshAt = 0,
+    craftables = {
+        Item = {},
+        Fluid = {},
+        Chemical = {},
+    },
+    patterns = {},
+    lastError = nil,
+}
+
 local RESOURCE_DEFS_BY_KEY = {}
 for _, def in ipairs(RESOURCE_TYPES) do
     RESOURCE_DEFS_BY_KEY[def.key] = def
@@ -814,6 +832,7 @@ local function webSendHello()
                 "delete_rule",
                 "create_rule",
                 "update_thresholds",
+                "craft_resource",
             },
         },
     })
@@ -877,6 +896,58 @@ local function replaceRule(index, patch)
     return true
 end
 
+local function categoryCraftMethod(category)
+    for _, def in ipairs(RESOURCE_TYPES) do
+        if def.key == category then return def.craftMethod end
+    end
+
+    return nil
+end
+
+local function baseResourceName(payload)
+    local name = payload.name or payload.id or payload.resource
+
+    if not name and payload.key then
+        name = tostring(payload.key):match("([^#]+)")
+    end
+
+    return name
+end
+
+local function craftResourceFromWeb(payload)
+    if type(payload) ~= "table" then return false, "payload must be a table" end
+
+    local category = tostring(payload.category or "Item")
+    local method = categoryCraftMethod(category)
+    if not method then return false, "unsupported craft category: " .. category end
+    if not has(method) then return false, method .. " method is not available" end
+
+    local count = tonumber(payload.amount or payload.count)
+    if not count or count <= 0 then return false, "amount must be positive" end
+
+    local filter = {
+        name = baseResourceName(payload),
+        count = math.floor(count),
+    }
+
+    if payload.fingerprint then
+        filter.fingerprint = payload.fingerprint
+        filter.name = nil
+    end
+
+    if not filter.name and not filter.fingerprint then
+        return false, "resource name or fingerprint is required"
+    end
+
+    local job, err = call(method, filter)
+    if job ~= nil and job ~= false then
+        logAutocraft("Web craft requested: " .. tostring(category) .. " " .. tostring(filter.name or filter.fingerprint) .. " x" .. fmtNumber(filter.count))
+        return true, "craft queued"
+    end
+
+    return false, tostring(err or method .. " failed")
+end
+
 local function handleWebCommand(command)
     if type(command) ~= "table" then return false, "command must be a table" end
 
@@ -929,6 +1000,8 @@ local function handleWebCommand(command)
         local ok, err = applyRuntimeConfig(payload)
         if ok then saveRuntimeConfigCache() end
         return ok, err or "thresholds updated"
+    elseif action == "craft_resource" then
+        return craftResourceFromWeb(payload)
     end
 
     return false, "unknown action: " .. tostring(action)
@@ -1852,6 +1925,175 @@ local function stackKey(stack)
     return tostring(base) .. "#" .. tostring(nbt)
 end
 
+local function stackBaseName(stack)
+    if type(stack) ~= "table" then return nil end
+
+    return stack.name
+        or stack.id
+        or stack.fluid
+        or stack.chemical
+        or stack.resource
+        or stack.item
+end
+
+local function stackVariant(stack)
+    if type(stack) ~= "table" then return nil, nil end
+
+    local fingerprint = stack.fingerprint or stack.fingerPrint
+    local nbtHash = stack.nbtHash or stack.nbt or stack.damage or stack.metadata
+
+    if type(fingerprint) ~= "string" and type(fingerprint) ~= "number" then
+        fingerprint = nil
+    end
+
+    if type(nbtHash) ~= "string" and type(nbtHash) ~= "number" then
+        nbtHash = nil
+    end
+
+    return fingerprint and tostring(fingerprint) or nil, nbtHash and tostring(nbtHash) or nil
+end
+
+local function compactResourceStack(stack, categoryKey, unit)
+    if type(stack) ~= "table" then return nil end
+
+    local name = stackBaseName(stack)
+    local label = stackLabel(stack) or name
+    local fingerprint, nbtHash = stackVariant(stack)
+    local key = stack.key or stack.resourceKey
+
+    if not key then
+        local base = name or label
+        if not base then return nil end
+
+        local variant = fingerprint or nbtHash
+        key = variant and (tostring(base) .. "#" .. tostring(variant)) or tostring(base)
+    end
+
+    return {
+        key = tostring(key),
+        name = name and tostring(name) or nil,
+        displayName = label and tostring(label) or nil,
+        amount = stackAmount(stack),
+        unit = unit,
+        category = categoryKey,
+        fingerprint = fingerprint,
+        nbtHash = nbtHash,
+    }
+end
+
+local function compactResourceList(list, categoryKey, unit)
+    local byKey = {}
+    local result = {}
+
+    if type(list) ~= "table" then return result end
+
+    for _, stack in pairs(list) do
+        local compact = compactResourceStack(stack, categoryKey, unit)
+
+        if compact then
+            local existing = byKey[compact.key]
+            if existing then
+                existing.amount = (tonumber(existing.amount) or 0) + (tonumber(compact.amount) or 0)
+                if not existing.displayName and compact.displayName then existing.displayName = compact.displayName end
+            else
+                byKey[compact.key] = compact
+                table.insert(result, compact)
+            end
+        end
+    end
+
+    table.sort(result, function(a, b)
+        return tostring(a.displayName or a.name or a.key) < tostring(b.displayName or b.name or b.key)
+    end)
+
+    return result
+end
+
+local function firstArrayValue(value)
+    if type(value) ~= "table" then return nil end
+
+    if value[1] ~= nil then return value[1] end
+
+    for _, item in pairs(value) do
+        return item
+    end
+
+    return nil
+end
+
+local function compactPattern(pattern)
+    if type(pattern) ~= "table" then return nil end
+
+    local output = pattern.output
+        or pattern.result
+        or firstArrayValue(pattern.outputs)
+        or firstArrayValue(pattern.results)
+        or pattern
+
+    local outputCategory =
+        (type(output) == "table" and (output.category or output.categoryKey))
+        or pattern.category
+        or pattern.categoryKey
+        or "Item"
+    local compactOutput = compactResourceStack(output, outputCategory, output.unit)
+
+    if not compactOutput then return nil end
+
+    local ingredientsRaw = pattern.ingredients
+        or pattern.inputs
+        or pattern.input
+        or (type(pattern.pattern) == "table" and (pattern.pattern.ingredients or pattern.pattern.inputs))
+
+    return {
+        category = compactOutput.category,
+        output = compactOutput,
+        ingredients = compactResourceList(ingredientsRaw, "Item", "items"),
+    }
+end
+
+local function refreshCraftingMetadata(force)
+    local now = nowMillis()
+    local interval = ((CONFIG.web and CONFIG.web.craftableRefreshSeconds) or 15) * 1000
+
+    if not force and CRAFT_CACHE.lastRefreshAt > 0 and now - CRAFT_CACHE.lastRefreshAt < interval then
+        return
+    end
+
+    CRAFT_CACHE.lastRefreshAt = now
+    CRAFT_CACHE.lastError = nil
+
+    for _, def in ipairs(RESOURCE_TYPES) do
+        local list = nil
+
+        if def.craftableList and has(def.craftableList) then
+            local value, err = call(def.craftableList)
+            if type(value) == "table" then
+                list = compactResourceList(value, def.key, def.unit)
+            elseif err then
+                CRAFT_CACHE.lastError = tostring(err)
+            end
+        end
+
+        CRAFT_CACHE.craftables[def.key] = list or {}
+    end
+
+    local patterns = {}
+    if has("getPatterns") then
+        local value, err = call("getPatterns")
+
+        if type(value) == "table" then
+            for _, pattern in pairs(value) do
+                local compact = compactPattern(pattern)
+                if compact then table.insert(patterns, compact) end
+            end
+        elseif err then
+            CRAFT_CACHE.lastError = tostring(err)
+        end
+    end
+
+    CRAFT_CACHE.patterns = patterns
+end
+
 local function updateResourceTrends(categoryKey, list, timestamp)
     local tracked = RESOURCE_TRENDS[categoryKey]
     local def = RESOURCE_DEFS_BY_KEY[categoryKey]
@@ -2073,6 +2315,7 @@ local function collectSnapshot()
         alerts = {},
         tps = getAverageTps(),
         web = webStatus(),
+        patterns = {},
 			autocraft = processAutocraft(nil),
         }
 
@@ -2111,6 +2354,7 @@ local function collectSnapshot()
     end
 
     snapshot.energy = readEnergy()
+    refreshCraftingMetadata(false)
 	local itemListForAutocraft = nil
     for _, def in ipairs(RESOURCE_TYPES) do
         local data = readStorageDetailed(def)
@@ -2131,7 +2375,10 @@ local function collectSnapshot()
 
         updateResourceTrends(data.key, data.list, sampleTime)
 
-        -- Do not keep huge lists in snapshot after top calculations.
+        data.resources = compactResourceList(data.list, data.key, data.unit)
+        data.craftables = CRAFT_CACHE.craftables[data.key] or {}
+
+        -- Do not keep huge raw lists in snapshot after compacting.
         data.list = nil
 
         local external = readExternalStorage(def)
@@ -2150,6 +2397,8 @@ local function collectSnapshot()
 	snapshot.autocraft = processAutocraft(itemListForAutocraft)
     snapshot.topGrowing = getTopResourceRates(nil, "up", CONFIG.topRows + 4)
     snapshot.topDecreasing = getTopResourceRates(nil, "down", CONFIG.topRows + 4)
+    snapshot.patterns = CRAFT_CACHE.patterns or {}
+    snapshot.craftMetadataError = CRAFT_CACHE.lastError
     snapshot.tps = getAverageTps()
     snapshot.web = webStatus()
     snapshot.alerts = buildAlerts(snapshot)

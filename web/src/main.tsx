@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Bell,
   Boxes,
   CheckCircle2,
@@ -15,15 +18,32 @@ import {
   Plus,
   Power,
   Save,
+  Search,
   Server,
   Settings,
   ShieldAlert,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   X,
   Zap,
 } from "lucide-react";
-import { eventsUrl, getHistory, getLatest, login, saveConfig, sendCommand } from "./lib/api";
+import {
+  CraftPreview,
+  ResourceCategory,
+  ResourceRow,
+  eventsUrl,
+  getCraftPreview,
+  getHistory,
+  getLatest,
+  getResourceHistory,
+  getResourceTop,
+  getResources,
+  login,
+  requestCraft,
+  saveConfig,
+  sendCommand,
+} from "./lib/api";
 import "./styles.css";
 
 type View = "overview" | "items" | "fluids" | "chemicals" | "autocraft" | "settings";
@@ -79,6 +99,21 @@ function formatCompact(value: unknown) {
   return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n);
 }
 
+function formatRate(value: unknown, unit = "/s") {
+  const n = Number(value);
+  if (!Number.isFinite(n) || Math.abs(n) < 0.000001) return "0/s";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${formatCompact(n)}${unit}`;
+}
+
+function displayResourceName(resource?: Pick<ResourceRow, "displayName" | "name" | "key"> | null) {
+  return resource?.displayName || resource?.name || resource?.key || "Unknown resource";
+}
+
+function baseResourceId(resource?: Pick<ResourceRow, "name" | "key"> | null) {
+  return String(resource?.name || resource?.key || "").split("#")[0];
+}
+
 function percent(value: unknown) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "n/a";
@@ -91,6 +126,31 @@ function cls(...values: Array<string | false | null | undefined>) {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value ?? {}));
+}
+
+function useIconManifest() {
+  const [manifest, setManifest] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    fetch("/assets/mc-icons/manifest.json")
+      .then((response) => (response.ok ? response.json() : {}))
+      .then((data) => setManifest(data && typeof data === "object" ? (data as Record<string, string>) : {}))
+      .catch(() => setManifest({}));
+  }, []);
+
+  return manifest;
+}
+
+function ResourceIcon({ resource, manifest }: { resource: ResourceRow; manifest: Record<string, string> }) {
+  const id = baseResourceId(resource);
+  const src = id ? manifest[id] : undefined;
+  const letter = displayResourceName(resource).replace(/^\[[^\]]+\]\s*/, "").slice(0, 1).toUpperCase();
+
+  return (
+    <span className={cls("resource-icon", resource.category.toLowerCase())}>
+      {src ? <img src={src} alt="" loading="lazy" /> : <span>{letter || "?"}</span>}
+    </span>
+  );
 }
 
 function Login({ onDone }: { onDone: () => void }) {
@@ -193,6 +253,122 @@ function TrendPanel({ title, metric, category, tone }: { title: string; metric: 
   );
 }
 
+const historyRanges = [
+  { id: "5m", label: "5m" },
+  { id: "1h", label: "1h" },
+  { id: "24h", label: "24h" },
+  { id: "7d", label: "7d" },
+];
+
+function HistoryChart({ category, resource, tone }: { category: ResourceCategory; resource: ResourceRow | null; tone: "mint" | "blue" | "violet" }) {
+  const [range, setRange] = useState("1h");
+  const [points, setPoints] = useState<Array<{ createdAt: string; value: number }>>([]);
+  const [hover, setHover] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!resource) {
+      setPoints([]);
+      return;
+    }
+
+    getResourceHistory(category, resource.key, range)
+      .then((data) => setPoints(data.points))
+      .catch(() => setPoints([]));
+  }, [category, range, resource?.key]);
+
+  const chart = useMemo<{
+    valid: Array<{ createdAt: string; value: number; time: number; x: number; y: number }>;
+    path: string;
+    area: string;
+    min: number;
+    max: number;
+  }>(() => {
+    const valid = points
+      .map((point) => ({ ...point, value: Number(point.value), time: new Date(point.createdAt).getTime() }))
+      .filter((point) => Number.isFinite(point.value) && Number.isFinite(point.time));
+    if (!valid.length) return { valid: [], path: "", area: "", min: 0, max: 0 };
+
+    const minTime = valid[0].time;
+    const maxTime = valid[valid.length - 1].time || minTime + 1;
+    const min = Math.min(...valid.map((point) => point.value));
+    const max = Math.max(...valid.map((point) => point.value));
+    const span = max - min || 1;
+    const widthSpan = maxTime - minTime || 1;
+    const coords = valid.map((point) => ({
+      ...point,
+      x: ((point.time - minTime) / widthSpan) * 94 + 3,
+      y: 92 - ((point.value - min) / span) * 76,
+    }));
+
+    let path = `M ${coords[0].x.toFixed(2)} ${coords[0].y.toFixed(2)}`;
+    for (let i = 1; i < coords.length; i += 1) {
+      path += ` H ${coords[i].x.toFixed(2)} V ${coords[i].y.toFixed(2)}`;
+    }
+    const area = `${path} L ${coords[coords.length - 1].x.toFixed(2)} 96 L ${coords[0].x.toFixed(2)} 96 Z`;
+
+    return { valid: coords, path, area, min, max };
+  }, [points]);
+
+  const active = hover !== null ? chart.valid[hover] : null;
+
+  function onPointerMove(event: React.PointerEvent<SVGSVGElement>) {
+    if (!chart.valid.length) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * 100;
+    let nearest = 0;
+    let distance = Infinity;
+    chart.valid.forEach((point, index) => {
+      const next = Math.abs(point.x - x);
+      if (next < distance) {
+        distance = next;
+        nearest = index;
+      }
+    });
+    setHover(nearest);
+  }
+
+  return (
+    <section className="card history-card">
+      <div className="toolbar compact">
+        <div>
+          <h3>{resource ? displayResourceName(resource) : `${category} history`}</h3>
+          <p>{resource ? baseResourceId(resource) : "Select a resource"}</p>
+        </div>
+        <div className="range-tabs" role="tablist" aria-label="History range">
+          {historyRanges.map((item) => (
+            <button className={range === item.id ? "active" : ""} key={item.id} onClick={() => setRange(item.id)}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="history-plot">
+        <svg className={cls("chart", "history-svg", `chart-${tone}`)} viewBox="0 0 100 100" preserveAspectRatio="none" onPointerMove={onPointerMove} onPointerLeave={() => setHover(null)}>
+          <path className="grid-line" d="M 3 16 H 97 M 3 54 H 97 M 3 92 H 97 M 3 16 V 92 M 50 16 V 92 M 97 16 V 92" />
+          {chart.area && <path className="chart-area" d={chart.area} />}
+          {chart.path && <path className="chart-line step-line" d={chart.path} />}
+          {active && (
+            <>
+              <path className="hover-line" d={`M ${active.x.toFixed(2)} 14 V 94`} />
+              <circle className="hover-point" cx={active.x} cy={active.y} r="1.8" />
+            </>
+          )}
+        </svg>
+        <div className="axis-label top">{formatCompact(chart.max)}</div>
+        <div className="axis-label bottom">{formatCompact(chart.min)}</div>
+        {active && (
+          <div className="chart-tooltip" style={{ left: `${Math.min(Math.max(active.x, 12), 88)}%`, top: `${Math.min(Math.max(active.y, 16), 78)}%` }}>
+            <strong>{formatNumber(active.value)}</strong>
+            <span>{new Date(active.createdAt).toLocaleString()}</span>
+          </div>
+        )}
+        {!chart.valid.length && <p className="empty-chart">No history yet.</p>}
+      </div>
+    </section>
+  );
+}
+
 function Overview({ snapshot, config, setView }: { snapshot: any; config: any; setView: (view: View) => void }) {
   const storages = snapshot?.storages ?? [];
   const item = storages.find((storage: any) => storage.key === "Item") ?? storages[0];
@@ -276,16 +452,196 @@ function Overview({ snapshot, config, setView }: { snapshot: any; config: any; s
   );
 }
 
-function ResourceView({ category, tone }: { category: string; tone: "mint" | "blue" | "violet" }) {
+function ResourceTopPanel({ title, icon, resources, manifest }: { title: string; icon: React.ReactNode; resources: ResourceRow[]; manifest: Record<string, string> }) {
   return (
-    <section className="panel">
-      <div className="toolbar">
-        <div>
-          <h2>{category} usage</h2>
-          <p>Storage pressure and trend history from saved snapshots.</p>
-        </div>
+    <section className="card top-panel">
+      <div className="card-title">
+        <span>{icon}{title}</span>
       </div>
-      <TrendPanel title={`${category} storage`} metric="usedPercent" category={category} tone={tone} />
+      {resources.length === 0 && <p className="muted">No data yet.</p>}
+      {resources.map((resource) => (
+        <div className="top-resource" key={`${resource.category}:${resource.key}`}>
+          <ResourceIcon resource={resource} manifest={manifest} />
+          <span>{displayResourceName(resource)}</span>
+          <strong>{formatCompact(resource.amount)}</strong>
+          <em className={Number(resource.lastRate) < 0 ? "negative" : Number(resource.lastRate) > 0 ? "positive" : ""}>{formatRate(resource.lastRate)}</em>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function CraftDrawer({ resource, onClose }: { resource: ResourceRow; onClose: () => void }) {
+  const [amount, setAmount] = useState(64);
+  const [preview, setPreview] = useState<CraftPreview | null>(null);
+  const [status, setStatus] = useState("");
+
+  useEffect(() => {
+    setStatus("");
+    getCraftPreview(resource.category, resource.key, amount)
+      .then(setPreview)
+      .catch((error) => {
+        setPreview(null);
+        setStatus(error instanceof Error ? error.message : "Preview failed");
+      });
+  }, [amount, resource.category, resource.key]);
+
+  async function submit() {
+    setStatus("Queueing...");
+    try {
+      await requestCraft(resource.category, resource.key, amount);
+      setStatus("Craft request queued");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Craft request failed");
+    }
+  }
+
+  const max = preview?.maxAmount;
+
+  return (
+    <div className="drawer-backdrop" onMouseDown={onClose}>
+      <div className="craft-drawer" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="toolbar">
+          <div>
+            <p className="eyebrow">Craft request</p>
+            <h2>{displayResourceName(resource)}</h2>
+            <p>{baseResourceId(resource)}</p>
+          </div>
+          <button className="icon-button" onClick={onClose} title="Close"><X size={17} /></button>
+        </div>
+
+        <div className="craft-amount-row">
+          <label>
+            Amount
+            <input min={1} type="number" value={amount} onChange={(event) => setAmount(Math.max(1, Number(event.target.value) || 1))} />
+          </label>
+          <button disabled={max === null || max === undefined} onClick={() => max !== null && max !== undefined && setAmount(Math.max(1, Math.floor(max)))}>
+            Max {max !== null && max !== undefined ? formatCompact(max) : "n/a"}
+          </button>
+        </div>
+
+        <section className="craft-section">
+          <h3>Ingredients</h3>
+          {preview?.ingredients?.length ? preview.ingredients.map((ingredient) => (
+            <div className="ingredient-row" key={`${ingredient.category}:${ingredient.key}`}>
+              <span>{ingredient.displayName || ingredient.name || ingredient.key}</span>
+              <strong>{formatCompact(ingredient.amount)} {ingredient.unit ?? ""}</strong>
+              <em>{ingredient.available !== undefined ? `${formatCompact(ingredient.available)} available` : "availability unknown"}</em>
+            </div>
+          )) : <p className="muted">Ingredients unavailable from bridge pattern data.</p>}
+        </section>
+
+        {preview?.warnings?.map((warning) => <p className="alert warning" key={warning}>{warning}</p>)}
+        {status && <p className={cls("save-state", status.includes("failed") || status.includes("error") ? "error-state" : "")}>{status}</p>}
+
+        <button className="primary craft-submit" disabled={!preview?.craftable || (max !== null && max !== undefined && amount > max)} onClick={submit}>
+          <Sparkles size={17} />Request craft
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ResourceView({ category, tone, refreshKey }: { category: ResourceCategory; tone: "mint" | "blue" | "violet"; refreshKey?: string }) {
+  const manifest = useIconManifest();
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<"amount" | "rate" | "name">("amount");
+  const [order, setOrder] = useState<"asc" | "desc">("desc");
+  const [resources, setResources] = useState<ResourceRow[]>([]);
+  const [topAmount, setTopAmount] = useState<ResourceRow[]>([]);
+  const [topGrowth, setTopGrowth] = useState<ResourceRow[]>([]);
+  const [topDecline, setTopDecline] = useState<ResourceRow[]>([]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [drawerResource, setDrawerResource] = useState<ResourceRow | null>(null);
+  const [loading, setLoading] = useState("loading");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading("loading");
+    Promise.all([
+      getResources({ category, q: query, sort, order, limit: 700 }),
+      getResourceTop(category, "amount", 8),
+      getResourceTop(category, "growth", 8),
+      getResourceTop(category, "decline", 8),
+    ])
+      .then(([all, amountRows, growthRows, declineRows]) => {
+        if (cancelled) return;
+        setResources(all.resources);
+        setTopAmount(amountRows.resources);
+        setTopGrowth(growthRows.resources);
+        setTopDecline(declineRows.resources);
+        setSelectedKey((current) => current ?? all.resources[0]?.key ?? null);
+        setLoading("ready");
+      })
+      .catch(() => {
+        if (!cancelled) setLoading("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [category, order, query, refreshKey, sort]);
+
+  const selected = resources.find((resource) => resource.key === selectedKey) ?? resources[0] ?? null;
+  const title = category === "Item" ? "Items" : category === "Fluid" ? "Fluids" : "Chemicals";
+
+  function toggleSort(nextSort: "amount" | "rate" | "name") {
+    if (sort === nextSort) {
+      setOrder(order === "asc" ? "desc" : "asc");
+    } else {
+      setSort(nextSort);
+      setOrder(nextSort === "name" ? "asc" : "desc");
+    }
+  }
+
+  return (
+    <section className="resource-workspace">
+      <div className="resource-top-grid">
+        <ResourceTopPanel title="Most stored" icon={<Boxes size={15} />} resources={topAmount} manifest={manifest} />
+        <ResourceTopPanel title="Fastest growth" icon={<ArrowUp size={15} />} resources={topGrowth} manifest={manifest} />
+        <ResourceTopPanel title="Fastest drop" icon={<ArrowDown size={15} />} resources={topDecline} manifest={manifest} />
+      </div>
+
+      <div className="resource-main-grid">
+        <section className="card resource-table-card">
+          <div className="toolbar">
+            <div>
+              <h2>{title}</h2>
+              <p>{resources.length} resources · {loading}</p>
+            </div>
+            <div className="search-box">
+              <Search size={16} />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title.toLowerCase()}`} />
+            </div>
+          </div>
+
+          <div className="resource-sort-row">
+            <button onClick={() => toggleSort("amount")}><ArrowUpDown size={15} />Amount</button>
+            <button onClick={() => toggleSort("rate")}><ArrowUpDown size={15} />Rate</button>
+            <button onClick={() => toggleSort("name")}><ArrowUpDown size={15} />Name</button>
+            <span>{sort} · {order}</span>
+          </div>
+
+          <div className="resource-table">
+            {resources.map((resource) => (
+              <button className={cls("resource-grid-row", selected?.key === resource.key && "selected", resource.craftable && "craftable")} key={`${resource.category}:${resource.key}`} onClick={() => setSelectedKey(resource.key)}>
+                <ResourceIcon resource={resource} manifest={manifest} />
+                <span className="resource-name">
+                  <strong>{displayResourceName(resource)}</strong>
+                  <small>{baseResourceId(resource)}</small>
+                </span>
+                <strong>{formatCompact(resource.amount)}</strong>
+                <em className={Number(resource.lastRate) < 0 ? "negative" : Number(resource.lastRate) > 0 ? "positive" : ""}>{formatRate(resource.lastRate)}</em>
+                {resource.craftable ? <span className="craft-pill" onClick={(event) => { event.stopPropagation(); setDrawerResource(resource); }}>Craft</span> : <span className="muted">-</span>}
+              </button>
+            ))}
+            {resources.length === 0 && <p className="muted">No resources match the current filter.</p>}
+          </div>
+        </section>
+
+        <HistoryChart category={category} resource={selected} tone={tone} />
+      </div>
+
+      {drawerResource && <CraftDrawer resource={drawerResource} onClose={() => setDrawerResource(null)} />}
     </section>
   );
 }
@@ -554,9 +910,9 @@ function App() {
           </span>
         </header>
         {view === "overview" && <Overview snapshot={snapshot} config={data?.config} setView={setView} />}
-        {view === "items" && <ResourceView category="Item" tone="mint" />}
-        {view === "fluids" && <ResourceView category="Fluid" tone="blue" />}
-        {view === "chemicals" && <ResourceView category="Chemical" tone="violet" />}
+        {view === "items" && <ResourceView category="Item" tone="mint" refreshKey={data?.snapshot?.createdAt} />}
+        {view === "fluids" && <ResourceView category="Fluid" tone="blue" refreshKey={data?.snapshot?.createdAt} />}
+        {view === "chemicals" && <ResourceView category="Chemical" tone="violet" refreshKey={data?.snapshot?.createdAt} />}
         {view === "autocraft" && <Autocraft snapshot={snapshot} config={data?.config} reload={reload} />}
         {view === "settings" && <SettingsView config={data?.config} reload={reload} />}
       </section>
