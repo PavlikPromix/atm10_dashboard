@@ -113,6 +113,10 @@ function sendJson(socket: ClientSocket, payload: unknown) {
   socket.send(JSON.stringify(payload));
 }
 
+function getSocket(connection: unknown): ClientSocket {
+  return ((connection as { socket?: ClientSocket }).socket ?? connection) as ClientSocket;
+}
+
 function broadcast(type: string, payload: unknown) {
   const message = JSON.stringify({ type, payload });
   for (const socket of [...browserClients]) {
@@ -133,6 +137,11 @@ async function ensureBootstrapData() {
         passwordHash: await bcrypt.hash(env.adminPassword, 12),
       },
     });
+  } else if (!(await bcrypt.compare(env.adminPassword, admin.passwordHash))) {
+    await prisma.user.update({
+      where: { id: admin.id },
+      data: { passwordHash: await bcrypt.hash(env.adminPassword, 12) },
+    });
   }
 
   const device = await prisma.device.findUnique({ where: { id: env.deviceId } });
@@ -140,6 +149,14 @@ async function ensureBootstrapData() {
     await prisma.device.create({
       data: {
         id: env.deviceId,
+        name: env.deviceName,
+        tokenHash: await bcrypt.hash(env.deviceToken, 12),
+      },
+    });
+  } else if (!(await bcrypt.compare(env.deviceToken, device.tokenHash))) {
+    await prisma.device.update({
+      where: { id: env.deviceId },
+      data: {
         name: env.deviceName,
         tokenHash: await bcrypt.hash(env.deviceToken, 12),
       },
@@ -408,7 +425,7 @@ async function main() {
   });
 
   app.get("/api/events", { websocket: true }, (connection, request) => {
-    const socket = connection.socket as ClientSocket;
+    const socket = getSocket(connection);
     const token = (request.query as any)?.token || request.cookies?.atm10_token;
     try {
       app.jwt.verify(token);
@@ -424,7 +441,7 @@ async function main() {
   });
 
   app.get("/cc/ws", { websocket: true }, (connection, request) => {
-    const socket = connection.socket as ClientSocket;
+    const socket = getSocket(connection);
     const headerDeviceId = String(request.headers["x-atm10-device-id"] ?? env.deviceId);
     let deviceId = headerDeviceId;
 
