@@ -16,7 +16,7 @@ const env = {
   jwtSecret: process.env.JWT_SECRET ?? "change-me-in-production",
   corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
   adminUsername: process.env.ADMIN_USERNAME ?? "admin",
-  adminPassword: process.env.ADMIN_PASSWORD ?? "admin",
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
   deviceId: process.env.DEVICE_ID ?? "atm10-main",
   deviceName: process.env.DEVICE_NAME ?? "ATM10 Main",
   deviceToken: process.env.DEVICE_TOKEN ?? "change-me",
@@ -159,6 +159,10 @@ function broadcast(type: string, payload: unknown) {
 }
 
 async function ensureBootstrapData() {
+  if (!env.adminPassword || env.adminPassword === "admin") {
+    throw new Error("ADMIN_PASSWORD must be set to a non-default value");
+  }
+
   const admin = await prisma.user.findUnique({ where: { username: env.adminUsername } });
   if (!admin) {
     await prisma.user.create({
