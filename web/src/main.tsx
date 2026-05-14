@@ -856,18 +856,120 @@ function App() {
 
   useEffect(() => {
     if (!ready) return;
-    reload();
     const interval = window.setInterval(reload, 10000);
-    const ws = new WebSocket(eventsUrl());
-    ws.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      if (message.type === "snapshot" || message.type === "config" || message.type === "config_ack") reload();
+    reload();
+
+    let ws: WebSocket | null = null;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectDelay = 1000;
+    let stopped = false;
+
+    const HEARTBEAT_INTERVAL_MS = 8000;
+    const MAX_RECONNECT_DELAY_MS = 15000;
+
+    const stopHeartbeat = () => {
+      if (heartbeat) {
+        window.clearInterval(heartbeat);
+        heartbeat = null;
+      }
     };
-    ws.onopen = () => setStatus("live");
-    ws.onclose = () => setStatus("offline");
+
+    const stopReconnect = () => {
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    const startHeartbeat = (socket: WebSocket) => {
+      stopHeartbeat();
+      heartbeat = window.setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        try {
+          socket.send(JSON.stringify({ type: "ping", at: Date.now() }));
+        } catch {
+          socket.close();
+        }
+      }, HEARTBEAT_INTERVAL_MS);
+    };
+
+    const scheduleReconnect = () => {
+      if (stopped) return;
+      stopReconnect();
+      reconnectTimer = window.setTimeout(() => {
+        connect();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, Math.max(reconnectDelay * 2, 1000));
+    };
+
+    const connect = () => {
+      if (stopped) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+      try {
+        const socket = new WebSocket(eventsUrl());
+        ws = socket;
+        const currentSocket = socket;
+        setStatus("connecting");
+
+        currentSocket.onmessage = (event) => {
+          if (stopped || ws !== currentSocket) return;
+
+          let message: any = null;
+          try {
+            const raw = typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+            message = JSON.parse(raw);
+          } catch {
+            return;
+          }
+
+          if (message && (message.type === "snapshot" || message.type === "config" || message.type === "config_ack")) {
+            reload();
+          }
+        };
+
+        currentSocket.onopen = () => {
+          if (stopped || ws !== currentSocket) return;
+
+          setStatus("live");
+          reconnectDelay = 1000;
+          startHeartbeat(currentSocket);
+        };
+
+        currentSocket.onclose = () => {
+          if (stopped || ws !== currentSocket) return;
+
+          stopHeartbeat();
+          setStatus("offline");
+          scheduleReconnect();
+        };
+
+        currentSocket.onerror = () => {
+          if (stopped || ws !== currentSocket) return;
+
+          stopHeartbeat();
+          if (currentSocket.readyState !== WebSocket.CLOSED && currentSocket.readyState !== WebSocket.CLOSING) {
+            currentSocket.close();
+          }
+        };
+      } catch {
+        setStatus("offline");
+        scheduleReconnect();
+        return;
+      }
+    };
+
+    connect();
+
     return () => {
+      stopped = true;
+      stopHeartbeat();
+      stopReconnect();
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close();
+      }
       window.clearInterval(interval);
-      ws.close();
     };
   }, [ready]);
 

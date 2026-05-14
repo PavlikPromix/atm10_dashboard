@@ -1181,6 +1181,20 @@ async function main() {
 
     browserClients.add(socket);
     sendJson(socket, { type: "ready" });
+    socket.on("message", (raw) => {
+      try {
+        const message = JSON.parse(String(raw));
+        if (message?.type === "ping") {
+          try {
+            sendJson(socket, { type: "pong", at: new Date().toISOString() });
+          } catch {
+            browserClients.delete(socket);
+          }
+        }
+      } catch {
+        // Ignore non-JSON websocket messages from browser clients.
+      }
+    });
     socket.on("close", () => browserClients.delete(socket));
     socket.on("error", () => browserClients.delete(socket));
   });
