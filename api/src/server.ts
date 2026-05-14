@@ -117,6 +117,36 @@ function getSocket(connection: unknown): ClientSocket {
   return ((connection as { socket?: ClientSocket }).socket ?? connection) as ClientSocket;
 }
 
+function asArray(value: unknown): any[] {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+
+  const entries = Object.entries(value);
+  if (entries.length === 0) return [];
+
+  if (entries.every(([key]) => /^\d+$/.test(key))) {
+    return entries.sort(([a], [b]) => Number(a) - Number(b)).map(([, item]) => item);
+  }
+
+  return Object.values(value);
+}
+
+function normalizeSnapshot(snapshot: any) {
+  if (!snapshot || typeof snapshot !== "object") return {};
+
+  return {
+    ...snapshot,
+    storages: asArray(snapshot.storages),
+    alerts: asArray(snapshot.alerts),
+    autocraft: snapshot.autocraft
+      ? {
+          ...snapshot.autocraft,
+          rows: asArray(snapshot.autocraft.rows),
+        }
+      : snapshot.autocraft,
+  };
+}
+
 function broadcast(type: string, payload: unknown) {
   const message = JSON.stringify({ type, payload });
   for (const socket of [...browserClients]) {
@@ -224,6 +254,8 @@ async function pruneOldData() {
 }
 
 async function persistSnapshot(deviceId: string, snapshot: any) {
+  const normalizedSnapshot = normalizeSnapshot(snapshot);
+
   await prisma.device.update({
     where: { id: deviceId },
     data: { lastSeenAt: new Date(), online: true },
@@ -232,12 +264,12 @@ async function persistSnapshot(deviceId: string, snapshot: any) {
   await prisma.snapshot.create({
     data: {
       deviceId,
-      payload: snapshot,
+      payload: normalizedSnapshot,
     },
   });
 
   const metricRows: Array<{ deviceId: string; metric: string; category?: string; value: number }> = [];
-  for (const storage of snapshot?.storages ?? []) {
+  for (const storage of normalizedSnapshot.storages) {
     const category = String(storage.key ?? storage.title ?? "storage");
     for (const metric of ["used", "free", "total", "usedPercent", "rate"]) {
       const value = Number(storage[metric]);
@@ -259,7 +291,7 @@ async function persistSnapshot(deviceId: string, snapshot: any) {
     await prisma.metricPoint.createMany({ data: metricRows });
   }
 
-  for (const alert of snapshot?.alerts ?? []) {
+  for (const alert of normalizedSnapshot.alerts) {
     if (alert?.severity && alert?.text) {
       await prisma.alertEvent.create({
         data: {
@@ -271,7 +303,7 @@ async function persistSnapshot(deviceId: string, snapshot: any) {
     }
   }
 
-  broadcast("snapshot", { deviceId, snapshot });
+  broadcast("snapshot", { deviceId, snapshot: normalizedSnapshot });
 }
 
 async function sendPendingCommands(deviceId: string) {
@@ -460,59 +492,64 @@ async function main() {
         return;
       }
 
-      if (message.type === "hello") {
-        deviceId = String(message.deviceId ?? headerDeviceId);
-        const device = await prisma.device.findUnique({ where: { id: deviceId } });
-        const token = String(message.token ?? request.headers["x-atm10-token"] ?? "");
+      try {
+        if (message.type === "hello") {
+          deviceId = String(message.deviceId ?? headerDeviceId);
+          const device = await prisma.device.findUnique({ where: { id: deviceId } });
+          const token = String(message.token ?? request.headers["x-atm10-token"] ?? "");
 
-        if (!device || !(await bcrypt.compare(token, device.tokenHash))) {
-          sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device token" });
-          socket.close();
+          if (!device || !(await bcrypt.compare(token, device.tokenHash))) {
+            sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device token" });
+            socket.close();
+            return;
+          }
+
+          deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
+          await prisma.device.update({
+            where: { id: deviceId },
+            data: {
+              online: true,
+              lastSeenAt: new Date(),
+              scriptVersion: message.scriptVersion ? String(message.scriptVersion) : undefined,
+              capabilities: message.capabilities ?? undefined,
+            },
+          });
+
+          const config = await getRuntimeConfig();
+          sendJson(socket, { type: "hello_ack", ok: true, configVersion: config.version });
+          await sendConfig(deviceId);
+          await sendPendingCommands(deviceId);
+          broadcast("device", { deviceId, online: true });
           return;
         }
 
-        deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
-        await prisma.device.update({
-          where: { id: deviceId },
-          data: {
-            online: true,
-            lastSeenAt: new Date(),
-            scriptVersion: message.scriptVersion ? String(message.scriptVersion) : undefined,
-            capabilities: message.capabilities ?? undefined,
-          },
-        });
+        const connectionState = deviceConnections.get(deviceId);
+        if (!connectionState?.authenticated) {
+          sendJson(socket, { type: "error", message: "hello required" });
+          return;
+        }
 
-        const config = await getRuntimeConfig();
-        sendJson(socket, { type: "hello_ack", ok: true, configVersion: config.version });
-        await sendConfig(deviceId);
-        await sendPendingCommands(deviceId);
-        broadcast("device", { deviceId, online: true });
-        return;
-      }
-
-      const connectionState = deviceConnections.get(deviceId);
-      if (!connectionState?.authenticated) {
-        sendJson(socket, { type: "error", message: "hello required" });
-        return;
-      }
-
-      if (message.type === "snapshot") {
-        await persistSnapshot(deviceId, message.snapshot);
-        await sendPendingCommands(deviceId);
-      } else if (message.type === "config_request") {
-        await sendConfig(deviceId);
-      } else if (message.type === "command_ack") {
-        await prisma.commandQueue.updateMany({
-          where: { id: String(message.commandId), deviceId },
-          data: {
-            status: message.status === "ok" ? "acked" : "error",
-            result: String(message.message ?? message.status ?? ""),
-            ackedAt: new Date(),
-          },
-        });
-        broadcast("command_ack", { deviceId, commandId: message.commandId, status: message.status, message: message.message });
-      } else if (message.type === "config_ack") {
-        broadcast("config_ack", { deviceId, version: message.version, status: message.status, message: message.message });
+        if (message.type === "snapshot") {
+          await persistSnapshot(deviceId, message.snapshot);
+          await sendPendingCommands(deviceId);
+        } else if (message.type === "config_request") {
+          await sendConfig(deviceId);
+        } else if (message.type === "command_ack") {
+          await prisma.commandQueue.updateMany({
+            where: { id: String(message.commandId), deviceId },
+            data: {
+              status: message.status === "ok" ? "acked" : "error",
+              result: String(message.message ?? message.status ?? ""),
+              ackedAt: new Date(),
+            },
+          });
+          broadcast("command_ack", { deviceId, commandId: message.commandId, status: message.status, message: message.message });
+        } else if (message.type === "config_ack") {
+          broadcast("config_ack", { deviceId, version: message.version, status: message.status, message: message.message });
+        }
+      } catch (error) {
+        app.log.error({ err: error, deviceId, messageType: message?.type }, "device websocket message failed");
+        sendJson(socket, { type: "error", message: "server error" });
       }
     });
 
