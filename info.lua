@@ -792,6 +792,21 @@ local function nowMillis()
     return math.floor(os.clock() * 1000)
 end
 
+local function webReconnectDelayMs()
+    return ((CONFIG.web and CONFIG.web.reconnectSeconds) or 10) * 1000
+end
+
+local function webMarkDisconnected(err, backoff)
+    if err then WEB.lastError = tostring(err) end
+    WEB.ws = nil
+    WEB.connected = false
+    WEB.authenticated = false
+
+    if backoff ~= false then
+        WEB.nextConnectAt = nowMillis() + webReconnectDelayMs()
+    end
+end
+
 local function logAutocraft(message)
     message = tostring(message or "")
 
@@ -826,10 +841,7 @@ local function webSend(kind, payload)
         return true
     end
 
-    WEB.lastError = tostring(err)
-    WEB.connected = false
-    WEB.authenticated = false
-    WEB.ws = nil
+    webMarkDisconnected(err, true)
     return false, WEB.lastError
 end
 
@@ -864,7 +876,7 @@ local function webConnectIfNeeded()
 
     if not http or not http.websocket then
         WEB.lastError = "http.websocket unavailable"
-        WEB.nextConnectAt = now + ((CONFIG.web.reconnectSeconds or 10) * 1000)
+        WEB.nextConnectAt = now + webReconnectDelayMs()
         return
     end
 
@@ -879,17 +891,16 @@ local function webConnectIfNeeded()
         WEB.authenticated = false
         WEB.lastError = nil
         WEB.lastMessageAt = os.date("%H:%M:%S")
+        WEB.nextConnectAt = 0
         WEB.reconnects = WEB.reconnects + 1
-        webSendHello()
+        local helloOk = webSendHello()
+        if not helloOk then return end
         webSend("config_request", { deviceId = CONFIG.web.deviceId })
         return
     end
 
-    WEB.ws = nil
-    WEB.connected = false
-    WEB.authenticated = false
-    WEB.lastError = tostring(err or wsOrErr or "connect failed")
-    WEB.nextConnectAt = now + ((CONFIG.web.reconnectSeconds or 10) * 1000)
+    webMarkDisconnected(err or wsOrErr or "connect failed", false)
+    WEB.nextConnectAt = now + webReconnectDelayMs()
 end
 
 local function ackCommand(commandId, status, message)
@@ -1036,6 +1047,13 @@ local function handleWebMessage(raw)
     if message.type == "hello_ack" then
         WEB.authenticated = message.ok == true
         WEB.configVersion = message.configVersion
+        if not WEB.authenticated then
+            local err = message.message or "web authentication failed"
+            if WEB.ws and WEB.ws.close then
+                pcall(function() WEB.ws.close() end)
+            end
+            webMarkDisconnected(err, true)
+        end
     elseif message.type == "config_update" then
         local ok, err = applyRuntimeConfig(message.config or {})
         if ok then
@@ -1069,10 +1087,7 @@ local function webReceiveAvailable()
         end)
 
         if not ok then
-            WEB.lastError = tostring(dataOrErr)
-            WEB.ws = nil
-            WEB.connected = false
-            WEB.authenticated = false
+            webMarkDisconnected(dataOrErr, true)
             return
         end
 
@@ -1081,11 +1096,13 @@ local function webReceiveAvailable()
         end
 
         handleWebMessage(dataOrErr)
+        if not WEB.ws then return end
     end
 end
 
 local function webSendSnapshot(snapshot)
     if not snapshot or not CONFIG.web or CONFIG.web.sendSnapshots ~= true then return end
+    if WEB.authenticated ~= true then return end
 
     webSend("snapshot", {
         deviceId = CONFIG.web.deviceId,

@@ -1,7 +1,57 @@
 export type ApiResult<T> = Promise<T>;
 
-async function request<T>(path: string, init: RequestInit = {}): ApiResult<T> {
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function clearAuthToken() {
+  localStorage.removeItem("atm10_token");
+}
+
+function isExpiredJwt(token: string) {
+  const payload = token.split(".")[1];
+  if (!payload) return true;
+
+  try {
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const decoded = JSON.parse(atob(padded));
+    return typeof decoded.exp === "number" && decoded.exp <= Date.now() / 1000;
+  } catch {
+    return true;
+  }
+}
+
+function currentAuthToken() {
   const token = localStorage.getItem("atm10_token");
+  if (!token) return null;
+  if (isExpiredJwt(token)) {
+    clearAuthToken();
+    return null;
+  }
+  return token;
+}
+
+export function hasAuthToken() {
+  return Boolean(currentAuthToken());
+}
+
+export function authToken() {
+  return currentAuthToken();
+}
+
+export function isUnauthorizedError(error: unknown) {
+  return error instanceof ApiError && error.status === 401;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): ApiResult<T> {
+  const token = authToken();
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -14,7 +64,8 @@ async function request<T>(path: string, init: RequestInit = {}): ApiResult<T> {
 
   if (!response.ok) {
     const message = await response.text();
-    throw new Error(message || response.statusText);
+    if (response.status === 401) clearAuthToken();
+    throw new ApiError(response.status, message || response.statusText);
   }
 
   return response.json();
@@ -127,6 +178,6 @@ export function sendCommand(action: string, payload: Record<string, unknown> = {
 
 export function eventsUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const token = encodeURIComponent(localStorage.getItem("atm10_token") ?? "");
+  const token = encodeURIComponent(authToken() ?? "");
   return `${protocol}//${window.location.host}/api/events?token=${token}`;
 }

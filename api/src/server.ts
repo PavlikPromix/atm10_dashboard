@@ -25,7 +25,7 @@ const LIVE_DEVICE_WINDOW_MS = 15_000;
 
 type ClientSocket = {
   send: (message: string) => void;
-  close: () => void;
+  close: (code?: number, reason?: string) => void;
   on: (event: "message" | "close" | "error", cb: (...args: any[]) => void) => void;
   readyState?: number;
 };
@@ -1193,7 +1193,7 @@ async function main() {
     try {
       app.jwt.verify(token);
     } catch {
-      socket.close();
+      socket.close(1008, "unauthorized");
       return;
     }
 

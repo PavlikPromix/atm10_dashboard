@@ -32,6 +32,7 @@ import {
   CraftPreview,
   ResourceCategory,
   ResourceRow,
+  clearAuthToken,
   eventsUrl,
   getCraftPreview,
   getHistory,
@@ -39,6 +40,8 @@ import {
   getResourceHistory,
   getResourceTop,
   getResources,
+  hasAuthToken,
+  isUnauthorizedError,
   login,
   requestCraft,
   saveConfig,
@@ -847,17 +850,39 @@ function SettingsView({ config, reload }: { config: any; reload: () => void }) {
 }
 
 function App() {
-  const [ready, setReady] = useState(Boolean(localStorage.getItem("atm10_token")));
+  const [ready, setReady] = useState(hasAuthToken());
   const [view, setView] = useState<View>("overview");
   const [data, setData] = useState<any>(null);
-  const [status, setStatus] = useState("loading");
+  const [socketStatus, setSocketStatus] = useState("loading");
 
-  const reload = () => getLatest().then(setData).then(() => setStatus("ready")).catch(() => setStatus("login"));
+  const requireLogin = () => {
+    clearAuthToken();
+    setData(null);
+    setSocketStatus("offline");
+    setReady(false);
+  };
+
+  const reload = async () => {
+    try {
+      const latest = await getLatest();
+      setData(latest);
+      return latest;
+    } catch (error) {
+      if (isUnauthorizedError(error)) {
+        requireLogin();
+      } else {
+        setSocketStatus((current) => (current === "live" ? current : "offline"));
+      }
+      throw error;
+    }
+  };
 
   useEffect(() => {
     if (!ready) return;
-    const interval = window.setInterval(reload, 10000);
-    reload();
+    const interval = window.setInterval(() => {
+      void reload().catch(() => undefined);
+    }, 10000);
+    void reload().catch(() => undefined);
 
     let ws: WebSocket | null = null;
     let heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -911,7 +936,7 @@ function App() {
         const socket = new WebSocket(eventsUrl());
         ws = socket;
         const currentSocket = socket;
-        setStatus("connecting");
+        setSocketStatus("connecting");
 
         currentSocket.onmessage = (event) => {
           if (stopped || ws !== currentSocket) return;
@@ -925,23 +950,28 @@ function App() {
           }
 
           if (message && (message.type === "snapshot" || message.type === "config" || message.type === "config_ack")) {
-            reload();
+            void reload().catch(() => undefined);
           }
         };
 
         currentSocket.onopen = () => {
           if (stopped || ws !== currentSocket) return;
 
-          setStatus("live");
+          setSocketStatus("live");
           reconnectDelay = 1000;
           startHeartbeat(currentSocket);
         };
 
-        currentSocket.onclose = () => {
+        currentSocket.onclose = (event) => {
           if (stopped || ws !== currentSocket) return;
 
           stopHeartbeat();
-          setStatus("offline");
+          if (event.code === 1008 || event.code === 4001) {
+            requireLogin();
+            return;
+          }
+
+          setSocketStatus("offline");
           scheduleReconnect();
         };
 
@@ -954,7 +984,7 @@ function App() {
           }
         };
       } catch {
-        setStatus("offline");
+        setSocketStatus("offline");
         scheduleReconnect();
         return;
       }
@@ -973,7 +1003,10 @@ function App() {
     };
   }, [ready]);
 
-  if (!ready || status === "login") return <Login onDone={() => setReady(true)} />;
+  if (!ready) return <Login onDone={() => {
+    setSocketStatus("loading");
+    setReady(true);
+  }} />;
 
   const snapshot = data?.snapshot?.payload;
   const online = data?.devices?.some((device: any) => device.online);
@@ -998,7 +1031,7 @@ function App() {
         <div className="side-status">
           <span className={online ? "state-dot ready" : "state-dot error"} />
           <strong>{online ? "Device online" : "Device offline"}</strong>
-          <small>Web socket: {status}</small>
+          <small>Web socket: {socketStatus}</small>
         </div>
       </aside>
       <section className="content">
