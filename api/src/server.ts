@@ -284,6 +284,10 @@ function stripHeavySnapshotFields(snapshot: any) {
       delete storage.resources;
       delete storage.craftables;
       delete storage._hasResourceList;
+      delete storage.resourcesFull;
+      delete storage.resourcesChanged;
+      delete storage.resourceCount;
+      delete storage.craftablesFull;
     }
   }
   delete cloned.craftables;
@@ -302,6 +306,10 @@ function normalizeSnapshot(snapshot: any) {
       return {
         ...source,
         _hasResourceList: Object.prototype.hasOwnProperty.call(source, "resources") || Object.prototype.hasOwnProperty.call(source, "list"),
+        resourcesFull: Boolean((source as any).resourcesFull),
+        resourcesChanged: Number((source as any).resourcesChanged ?? 0),
+        resourceCount: Number((source as any).resourceCount ?? 0),
+        craftablesFull: Boolean((source as any).craftablesFull),
         resources: asArray((source as any).resources ?? (source as any).list),
         craftables: asArray((source as any).craftables),
       };
@@ -509,11 +517,13 @@ async function syncCraftPatterns(deviceId: string, snapshot: any, now: Date) {
     );
   }
 
-  if (operations.length) await prisma.$transaction(operations);
+  for (let i = 0; i < operations.length; i += 100) {
+    await prisma.$transaction(operations.slice(i, i + 100));
+  }
 }
 
-async function persistResourceRows(deviceId: string, rows: NormalizedResource[], categoriesWithLists: Set<ResourceCategory>, now: Date) {
-  const categories = [...new Set([...categoriesWithLists, ...rows.map((row) => row.category)])];
+async function persistResourceRows(deviceId: string, rows: NormalizedResource[], categoriesWithFullLists: Set<ResourceCategory>, now: Date) {
+  const categories = [...new Set([...categoriesWithFullLists, ...rows.map((row) => row.category)])];
   if (!categories.length) return;
 
   const existingRows = await prisma.resourceCurrent.findMany({
@@ -528,17 +538,19 @@ async function persistResourceRows(deviceId: string, rows: NormalizedResource[],
   for (const row of rows) {
     const key = `${row.category}:${row.resourceKey}`;
     const existing = nextByKey.get(key);
+    const current = existingByKey.get(key);
+    const nextRow = row.craftable && row.amount === 0 && current ? { ...row, amount: current.amount } : row;
     if (existing) {
-      existing.amount += row.amount;
-      existing.craftable = existing.craftable || row.craftable;
+      if (!(row.craftable && row.amount === 0)) existing.amount += row.amount;
+      existing.craftable = existing.craftable || nextRow.craftable;
     } else {
-      nextByKey.set(key, { ...row });
+      nextByKey.set(key, { ...nextRow });
     }
   }
 
   for (const existing of existingRows) {
     const existingCategory = normalizeCategory(existing.category);
-    if (!existingCategory || !categoriesWithLists.has(existingCategory)) continue;
+    if (!existingCategory || !categoriesWithFullLists.has(existingCategory)) continue;
 
     const key = `${existing.category}:${existing.resourceKey}`;
     if (!nextByKey.has(key) && existing.amount !== 0) {
@@ -617,30 +629,31 @@ async function persistResourceRows(deviceId: string, rows: NormalizedResource[],
     operations.push(prisma.resourceSample.createMany({ data: samples }));
   }
 
-  if (operations.length) await prisma.$transaction(operations);
+  for (let i = 0; i < operations.length; i += 250) {
+    await prisma.$transaction(operations.slice(i, i + 250));
+  }
 }
 
 async function persistResourcesFromSnapshot(deviceId: string, snapshot: any, now: Date) {
   const rows: NormalizedResource[] = [];
-  const categoriesWithLists = new Set<ResourceCategory>();
+  const categoriesWithFullLists = new Set<ResourceCategory>();
 
   for (const storage of snapshot.storages ?? []) {
     const category = normalizeCategory(storage?.key);
     if (!category) continue;
 
     if (storage._hasResourceList) {
-      categoriesWithLists.add(category);
+      if (storage.resourcesFull) categoriesWithFullLists.add(category);
       rows.push(...normalizeResourceList(storage.resources, category, storage.unit));
     }
 
     const craftables = getCraftableLists(snapshot, category, storage);
     if (craftables.length) {
-      categoriesWithLists.add(category);
       rows.push(...craftables);
     }
   }
 
-  await persistResourceRows(deviceId, rows, categoriesWithLists, now);
+  await persistResourceRows(deviceId, rows, categoriesWithFullLists, now);
   await syncCraftPatterns(deviceId, snapshot, now);
 }
 

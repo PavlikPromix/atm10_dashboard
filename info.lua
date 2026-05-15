@@ -21,6 +21,9 @@ local CONFIG = {
         reconnectSeconds = 10,
         sendSnapshots = true,
         craftableRefreshSeconds = 15,
+        resourceFullSyncSeconds = 60,
+        sendCraftables = true,
+        sendPatterns = false,
         configPath = "atm10_dashboard_config.json",
         scriptVersion = "2.0.0",
     },
@@ -753,6 +756,7 @@ local WEB = {
 
 local CRAFT_CACHE = {
     lastRefreshAt = 0,
+    changed = false,
     craftables = {
         Item = {},
         Fluid = {},
@@ -760,6 +764,19 @@ local CRAFT_CACHE = {
     },
     patterns = {},
     lastError = nil,
+}
+
+local RESOURCE_WEB_SYNC = {
+    lastFullAt = {
+        Item = 0,
+        Fluid = 0,
+        Chemical = 0,
+    },
+    previous = {
+        Item = {},
+        Fluid = {},
+        Chemical = {},
+    },
 }
 
 local RESOURCE_DEFS_BY_KEY = {}
@@ -2009,6 +2026,63 @@ local function compactResourceList(list, categoryKey, unit)
     return result
 end
 
+local function resourceSyncSignature(row)
+    return table.concat({
+        tostring(row.amount or 0),
+        tostring(row.name or ""),
+        tostring(row.displayName or ""),
+        tostring(row.fingerprint or ""),
+        tostring(row.nbtHash or ""),
+    }, "|")
+end
+
+local function buildResourceWebDelta(list, categoryKey, unit)
+    local compact = compactResourceList(list, categoryKey, unit)
+    local now = nowMillis()
+    local fullInterval = ((CONFIG.web and CONFIG.web.resourceFullSyncSeconds) or 60) * 1000
+    local lastFull = RESOURCE_WEB_SYNC.lastFullAt[categoryKey] or 0
+    local full = lastFull <= 0 or now - lastFull >= fullInterval
+    local previous = RESOURCE_WEB_SYNC.previous[categoryKey] or {}
+    local nextState = {}
+    local changed = {}
+
+    for _, row in ipairs(compact) do
+        local signature = resourceSyncSignature(row)
+        nextState[row.key] = {
+            signature = signature,
+            row = row,
+        }
+
+        if full or not previous[row.key] or previous[row.key].signature ~= signature then
+            table.insert(changed, row)
+        end
+    end
+
+    if not full then
+        for key, old in pairs(previous) do
+            if not nextState[key] and old and old.row then
+                local removed = {}
+                for k, v in pairs(old.row) do removed[k] = v end
+                removed.amount = 0
+                table.insert(changed, removed)
+            end
+        end
+    end
+
+    if full then
+        RESOURCE_WEB_SYNC.lastFullAt[categoryKey] = now
+    end
+
+    RESOURCE_WEB_SYNC.previous[categoryKey] = nextState
+
+    return {
+        resources = changed,
+        full = full,
+        total = #compact,
+        changed = #changed,
+    }
+end
+
 local function firstArrayValue(value)
     if type(value) ~= "table" then return nil end
 
@@ -2056,16 +2130,20 @@ local function refreshCraftingMetadata(force)
     local interval = ((CONFIG.web and CONFIG.web.craftableRefreshSeconds) or 15) * 1000
 
     if not force and CRAFT_CACHE.lastRefreshAt > 0 and now - CRAFT_CACHE.lastRefreshAt < interval then
+        CRAFT_CACHE.changed = false
         return
     end
 
     CRAFT_CACHE.lastRefreshAt = now
+    CRAFT_CACHE.changed = true
     CRAFT_CACHE.lastError = nil
 
     for _, def in ipairs(RESOURCE_TYPES) do
         local list = nil
 
-        if def.craftableList and has(def.craftableList) then
+        if CONFIG.web and CONFIG.web.sendCraftables == false then
+            list = {}
+        elseif def.craftableList and has(def.craftableList) then
             local value, err = call(def.craftableList)
             if type(value) == "table" then
                 list = compactResourceList(value, def.key, def.unit)
@@ -2078,7 +2156,7 @@ local function refreshCraftingMetadata(force)
     end
 
     local patterns = {}
-    if has("getPatterns") then
+    if CONFIG.web and CONFIG.web.sendPatterns == true and has("getPatterns") then
         local value, err = call("getPatterns")
 
         if type(value) == "table" then
@@ -2092,6 +2170,7 @@ local function refreshCraftingMetadata(force)
     end
 
     CRAFT_CACHE.patterns = patterns
+    return true
 end
 
 local function updateResourceTrends(categoryKey, list, timestamp)
@@ -2354,7 +2433,7 @@ local function collectSnapshot()
     end
 
     snapshot.energy = readEnergy()
-    refreshCraftingMetadata(false)
+    local craftMetadataRefreshed = refreshCraftingMetadata(false) == true
 	local itemListForAutocraft = nil
     for _, def in ipairs(RESOURCE_TYPES) do
         local data = readStorageDetailed(def)
@@ -2375,8 +2454,16 @@ local function collectSnapshot()
 
         updateResourceTrends(data.key, data.list, sampleTime)
 
-        data.resources = compactResourceList(data.list, data.key, data.unit)
-        data.craftables = CRAFT_CACHE.craftables[data.key] or {}
+        local resourceDelta = buildResourceWebDelta(data.list, data.key, data.unit)
+        data.resources = resourceDelta.resources
+        data.resourcesFull = resourceDelta.full
+        data.resourceCount = resourceDelta.total
+        data.resourcesChanged = resourceDelta.changed
+
+        if craftMetadataRefreshed and CONFIG.web and CONFIG.web.sendCraftables ~= false then
+            data.craftables = CRAFT_CACHE.craftables[data.key] or {}
+            data.craftablesFull = true
+        end
 
         -- Do not keep huge raw lists in snapshot after compacting.
         data.list = nil
@@ -2394,10 +2481,12 @@ local function collectSnapshot()
     end
 
     snapshot.cells = readCells()
-	snapshot.autocraft = processAutocraft(itemListForAutocraft)
+    snapshot.autocraft = processAutocraft(itemListForAutocraft)
     snapshot.topGrowing = getTopResourceRates(nil, "up", CONFIG.topRows + 4)
     snapshot.topDecreasing = getTopResourceRates(nil, "down", CONFIG.topRows + 4)
-    snapshot.patterns = CRAFT_CACHE.patterns or {}
+    if craftMetadataRefreshed and CONFIG.web and CONFIG.web.sendPatterns == true then
+        snapshot.patterns = CRAFT_CACHE.patterns or {}
+    end
     snapshot.craftMetadataError = CRAFT_CACHE.lastError
     snapshot.tps = getAverageTps()
     snapshot.web = webStatus()
