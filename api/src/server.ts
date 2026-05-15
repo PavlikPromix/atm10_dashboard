@@ -1256,7 +1256,9 @@ async function main() {
   app.get("/cc/ws", { websocket: true }, (connection, request) => {
     const socket = getSocket(connection);
     const headerDeviceId = String(request.headers["x-atm10-device-id"] ?? env.deviceId).trim() || env.deviceId;
+    const headerToken = String(request.headers["x-atm10-token"] ?? "").trim();
     let deviceId = headerDeviceId;
+    let authInProgress = false;
 
     const closeDevice = async () => {
       const current = deviceConnections.get(deviceId);
@@ -1267,8 +1269,63 @@ async function main() {
       broadcast("device", { deviceId, online: false });
     };
 
-    app.log.info({ deviceId, ip: request.ip }, "device websocket opened");
-    sendJson(socket, { type: "server_ready", at: new Date().toISOString() });
+    const acceptDeviceConnection = async (nextDeviceId: string, token: string, hello: any, source: "headers" | "hello") => {
+      if (authInProgress) return;
+      authInProgress = true;
+
+      try {
+        deviceId = nextDeviceId.trim() || headerDeviceId;
+        const device = await prisma.device.findUnique({ where: { id: deviceId } });
+        app.log.info(
+          {
+            deviceId,
+            authSource: source,
+            scriptVersion: hello?.scriptVersion ? String(hello.scriptVersion) : undefined,
+            tokenPresent: token.length > 0,
+          },
+          "device hello received",
+        );
+
+        if (!device || !(await bcrypt.compare(token, device.tokenHash))) {
+          app.log.warn({ deviceId, authSource: source, deviceFound: Boolean(device), tokenPresent: token.length > 0 }, "device hello rejected");
+          sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device id or token" });
+          setTimeout(() => socket.close(1008, "invalid device credentials"), 250);
+          return;
+        }
+
+        const previous = deviceConnections.get(deviceId);
+        if (previous && previous.socket !== socket) {
+          try {
+            previous.socket.close(1000, "replaced by new connection");
+          } catch {
+            // Ignore stale socket close errors.
+          }
+        }
+
+        deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
+        deviceLastTouchAt.set(deviceId, Date.now());
+        await prisma.device.update({
+          where: { id: deviceId },
+          data: {
+            online: true,
+            lastSeenAt: new Date(),
+            scriptVersion: hello?.scriptVersion ? String(hello.scriptVersion) : undefined,
+            capabilities: hello?.capabilities ?? undefined,
+          },
+        });
+
+        const config = await getRuntimeConfig();
+        sendJson(socket, { type: "hello_ack", ok: true, configVersion: config.version });
+        await sendConfig(deviceId);
+        await sendPendingCommands(deviceId);
+        broadcast("device", { deviceId, online: true });
+        app.log.info({ deviceId, authSource: source, configVersion: config.version }, "device hello accepted");
+      } finally {
+        authInProgress = false;
+      }
+    };
+
+    app.log.info({ deviceId, ip: request.ip, headerTokenPresent: headerToken.length > 0 }, "device websocket opened");
 
     socket.on("message", async (raw) => {
       let message: any;
@@ -1281,52 +1338,8 @@ async function main() {
 
       try {
         if (message.type === "hello") {
-          deviceId = String(message.deviceId ?? headerDeviceId).trim() || headerDeviceId;
-          const device = await prisma.device.findUnique({ where: { id: deviceId } });
           const token = String(message.token ?? request.headers["x-atm10-token"] ?? "").trim();
-          app.log.info(
-            {
-              deviceId,
-              scriptVersion: message.scriptVersion ? String(message.scriptVersion) : undefined,
-              tokenPresent: token.length > 0,
-            },
-            "device hello received",
-          );
-
-          if (!device || !(await bcrypt.compare(token, device.tokenHash))) {
-            app.log.warn({ deviceId, deviceFound: Boolean(device), tokenPresent: token.length > 0 }, "device hello rejected");
-            sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device id or token" });
-            setTimeout(() => socket.close(1008, "invalid device credentials"), 250);
-            return;
-          }
-
-          const previous = deviceConnections.get(deviceId);
-          if (previous && previous.socket !== socket) {
-            try {
-              previous.socket.close(1000, "replaced by new connection");
-            } catch {
-              // Ignore stale socket close errors.
-            }
-          }
-
-          deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
-          deviceLastTouchAt.set(deviceId, Date.now());
-          await prisma.device.update({
-            where: { id: deviceId },
-            data: {
-              online: true,
-              lastSeenAt: new Date(),
-              scriptVersion: message.scriptVersion ? String(message.scriptVersion) : undefined,
-              capabilities: message.capabilities ?? undefined,
-            },
-          });
-
-          const config = await getRuntimeConfig();
-          sendJson(socket, { type: "hello_ack", ok: true, configVersion: config.version });
-          await sendConfig(deviceId);
-          await sendPendingCommands(deviceId);
-          broadcast("device", { deviceId, online: true });
-          app.log.info({ deviceId, configVersion: config.version }, "device hello accepted");
+          await acceptDeviceConnection(String(message.deviceId ?? headerDeviceId), token, message, "hello");
           return;
         }
 
@@ -1361,6 +1374,14 @@ async function main() {
         sendJson(socket, { type: "error", message: "server error" });
       }
     });
+
+    sendJson(socket, { type: "server_ready", at: new Date().toISOString() });
+    if (headerToken) {
+      void acceptDeviceConnection(headerDeviceId, headerToken, null, "headers").catch((error) => {
+        app.log.error({ err: error, deviceId }, "device header auth failed");
+        sendJson(socket, { type: "error", message: "server error" });
+      });
+    }
 
     socket.on("close", () => void closeDevice());
     socket.on("error", () => void closeDevice());
