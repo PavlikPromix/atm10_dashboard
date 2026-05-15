@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-atm10_dashboard}
       POSTGRES_USER: ${POSTGRES_USER:-atm10}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atm10_change_me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,15 +19,15 @@ services:
       context: ./api
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-atm10}:${POSTGRES_PASSWORD:-atm10_change_me}@postgres:5432/${POSTGRES_DB:-atm10_dashboard}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-atm10}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-atm10_dashboard}
       HOST: 0.0.0.0
       PORT: 3000
-      JWT_SECRET: ${JWT_SECRET:-change_me}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
       DEVICE_ID: ${DEVICE_ID:-atm10-main}
       DEVICE_NAME: ${DEVICE_NAME:-ATM10 Main}
-      DEVICE_TOKEN: ${DEVICE_TOKEN:-change-me}
+      DEVICE_TOKEN: ${DEVICE_TOKEN:?Set DEVICE_TOKEN in .env}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
     depends_on:
       postgres:

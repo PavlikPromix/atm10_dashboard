@@ -24,6 +24,24 @@ CONFIG.web.token = "the DEVICE_TOKEN from .env"
 
 For local LAN testing without HTTPS, use `ws://<server-ip>:8080/cc/ws`.
 
+## Connection Checklist
+
+The Lua script and the browser do not connect directly to each other. Both connect through the API:
+
+- Browser: `/api/events`
+- Lua / CC:Tweaked: `/cc/ws`
+
+If the dashboard shows the browser socket as live but the device as offline, check the Lua values first:
+
+```lua
+CONFIG.web.enabled = true
+CONFIG.web.url = "ws://<server-ip>:8080/cc/ws"
+CONFIG.web.deviceId = "atm10-main"
+CONFIG.web.token = "the DEVICE_TOKEN from .env"
+```
+
+When running the web client with Vite dev server, `/api` and `/cc` are proxied to `http://localhost:3000`, including WebSocket upgrades.
+
 ## VPS HTTPS
 
 Point your domain to the VPS, set `DOMAIN` and `CORS_ORIGIN=https://your-domain` in `.env`, then run:
