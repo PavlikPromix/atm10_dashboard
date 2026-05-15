@@ -59,6 +59,7 @@ async function request<T>(path: string, init: RequestInit = {}): ApiResult<T> {
   const response = await fetch(path, {
     ...init,
     headers,
+    cache: "no-store",
     credentials: "include",
   });
 

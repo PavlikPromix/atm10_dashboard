@@ -749,6 +749,8 @@ local WEB = {
     lastError = nil,
     lastMessageAt = nil,
     lastSendAt = nil,
+    lastSnapshotAt = nil,
+    lastSnapshotError = nil,
     nextConnectAt = 0,
     reconnects = 0,
     configVersion = nil,
@@ -895,7 +897,6 @@ local function webConnectIfNeeded()
         WEB.reconnects = WEB.reconnects + 1
         local helloOk = webSendHello()
         if not helloOk then return end
-        webSend("config_request", { deviceId = CONFIG.web.deviceId })
         return
     end
 
@@ -1080,12 +1081,15 @@ local function handleWebMessage(raw)
     end
 end
 
-local function webReceiveAvailable()
+local function webReceiveAvailable(waitSeconds)
     if not WEB.ws then return end
 
     for _ = 1, 5 do
+        local timeout = waitSeconds or 0
+        waitSeconds = 0
+
         local ok, dataOrErr = pcall(function()
-            return WEB.ws.receive(0)
+            return WEB.ws.receive(timeout)
         end)
 
         if not ok then
@@ -1106,11 +1110,18 @@ local function webSendSnapshot(snapshot)
     if not snapshot or not CONFIG.web or CONFIG.web.sendSnapshots ~= true then return end
     if WEB.authenticated ~= true then return end
 
-    webSend("snapshot", {
+    local ok, err = webSend("snapshot", {
         deviceId = CONFIG.web.deviceId,
         sentAt = os.date("%Y-%m-%dT%H:%M:%S"),
         snapshot = snapshot,
     })
+
+    if ok then
+        WEB.lastSnapshotAt = os.date("%H:%M:%S")
+        WEB.lastSnapshotError = nil
+    else
+        WEB.lastSnapshotError = tostring(err or "snapshot send failed")
+    end
 end
 
 local function webStatus()
@@ -1121,6 +1132,8 @@ local function webStatus()
         lastError = WEB.lastError,
         lastMessageAt = WEB.lastMessageAt,
         lastSendAt = WEB.lastSendAt,
+        lastSnapshotAt = WEB.lastSnapshotAt,
+        lastSnapshotError = WEB.lastSnapshotError,
         reconnects = WEB.reconnects,
         configVersion = WEB.configVersion,
     }
@@ -2575,7 +2588,18 @@ local function drawHeader(snapshot)
 
     local webText = ""
     if snapshot.web and snapshot.web.enabled then
-        webText = snapshot.web.connected and " | Web: connected" or " | Web: offline"
+        if snapshot.web.connected then
+            webText = snapshot.web.authenticated and " | Web: auth" or " | Web: connected, waiting auth"
+            if snapshot.web.lastSnapshotAt then
+                webText = webText .. " | Snapshot " .. tostring(snapshot.web.lastSnapshotAt)
+            end
+        else
+            webText = " | Web: offline"
+        end
+
+        if snapshot.web.lastSnapshotError or snapshot.web.lastError then
+            webText = webText .. " | " .. tostring(snapshot.web.lastSnapshotError or snapshot.web.lastError)
+        end
     end
 
     textAt(3, 2, bridgeText .. webText, color("white"), color("gray", "lightGray"), w - 6)
@@ -3392,7 +3416,7 @@ while true do
     if eventName == "timer" and event[2] == timerId then
         sampleTpsFromTimer()
         webConnectIfNeeded()
-        webReceiveAvailable()
+        webReceiveAvailable(WEB.ws and WEB.authenticated ~= true and 0.25 or 0)
 		
 		local ok, snapshotOrErr = pcall(collectSnapshot)
 

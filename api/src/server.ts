@@ -991,9 +991,13 @@ async function main() {
     return { ok: true };
   });
 
-  app.get("/api/dashboard/latest", { preHandler: authenticate }, async () => {
+  app.get("/api/dashboard/latest", { preHandler: authenticate }, async (_request, reply) => {
+    reply.header("Cache-Control", "no-store");
     const now = new Date();
-    const snapshot = await prisma.snapshot.findFirst({ orderBy: { createdAt: "desc" } });
+    const snapshot = await prisma.snapshot.findFirst({
+      where: { deviceId: env.deviceId },
+      orderBy: { createdAt: "desc" },
+    });
     const devices = await prisma.device.findMany({ orderBy: { updatedAt: "desc" } });
     const config = await getRuntimeConfig();
     return {
