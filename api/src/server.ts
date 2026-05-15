@@ -17,9 +17,9 @@ const env = {
   corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
   adminUsername: process.env.ADMIN_USERNAME ?? "admin",
   adminPassword: process.env.ADMIN_PASSWORD ?? "",
-  deviceId: process.env.DEVICE_ID ?? "atm10-main",
+  deviceId: (process.env.DEVICE_ID ?? "atm10-main").trim(),
   deviceName: process.env.DEVICE_NAME ?? "ATM10 Main",
-  deviceToken: process.env.DEVICE_TOKEN ?? "change-me",
+  deviceToken: (process.env.DEVICE_TOKEN ?? "change-me").trim(),
 };
 const LIVE_DEVICE_WINDOW_MS = 15_000;
 const DEVICE_TOUCH_THROTTLE_MS = 5_000;
@@ -1255,15 +1255,20 @@ async function main() {
 
   app.get("/cc/ws", { websocket: true }, (connection, request) => {
     const socket = getSocket(connection);
-    const headerDeviceId = String(request.headers["x-atm10-device-id"] ?? env.deviceId);
+    const headerDeviceId = String(request.headers["x-atm10-device-id"] ?? env.deviceId).trim() || env.deviceId;
     let deviceId = headerDeviceId;
 
     const closeDevice = async () => {
+      const current = deviceConnections.get(deviceId);
+      if (current?.socket !== socket) return;
       deviceConnections.delete(deviceId);
       deviceLastTouchAt.delete(deviceId);
       await prisma.device.updateMany({ where: { id: deviceId }, data: { online: false } });
       broadcast("device", { deviceId, online: false });
     };
+
+    app.log.info({ deviceId, ip: request.ip }, "device websocket opened");
+    sendJson(socket, { type: "server_ready", at: new Date().toISOString() });
 
     socket.on("message", async (raw) => {
       let message: any;
@@ -1276,14 +1281,32 @@ async function main() {
 
       try {
         if (message.type === "hello") {
-          deviceId = String(message.deviceId ?? headerDeviceId);
+          deviceId = String(message.deviceId ?? headerDeviceId).trim() || headerDeviceId;
           const device = await prisma.device.findUnique({ where: { id: deviceId } });
-          const token = String(message.token ?? request.headers["x-atm10-token"] ?? "");
+          const token = String(message.token ?? request.headers["x-atm10-token"] ?? "").trim();
+          app.log.info(
+            {
+              deviceId,
+              scriptVersion: message.scriptVersion ? String(message.scriptVersion) : undefined,
+              tokenPresent: token.length > 0,
+            },
+            "device hello received",
+          );
 
           if (!device || !(await bcrypt.compare(token, device.tokenHash))) {
-            sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device token" });
-            socket.close();
+            app.log.warn({ deviceId, deviceFound: Boolean(device), tokenPresent: token.length > 0 }, "device hello rejected");
+            sendJson(socket, { type: "hello_ack", ok: false, message: "invalid device id or token" });
+            setTimeout(() => socket.close(1008, "invalid device credentials"), 250);
             return;
+          }
+
+          const previous = deviceConnections.get(deviceId);
+          if (previous && previous.socket !== socket) {
+            try {
+              previous.socket.close(1000, "replaced by new connection");
+            } catch {
+              // Ignore stale socket close errors.
+            }
           }
 
           deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
@@ -1303,6 +1326,7 @@ async function main() {
           await sendConfig(deviceId);
           await sendPendingCommands(deviceId);
           broadcast("device", { deviceId, online: true });
+          app.log.info({ deviceId, configVersion: config.version }, "device hello accepted");
           return;
         }
 

@@ -19,6 +19,8 @@ local CONFIG = {
         deviceId = "atm10-main",
         token = "change-me",
         reconnectSeconds = 10,
+        helloRetrySeconds = 5,
+        authTimeoutSeconds = 15,
         sendSnapshots = true,
         craftableRefreshSeconds = 15,
         resourceFullSyncSeconds = 60,
@@ -747,6 +749,10 @@ local WEB = {
     connected = false,
     authenticated = false,
     lastError = nil,
+    authStartedAt = nil,
+    lastServerReadyAt = nil,
+    lastHelloSentAt = nil,
+    lastHelloAckAt = nil,
     lastMessageAt = nil,
     lastSendAt = nil,
     lastSnapshotAt = nil,
@@ -803,6 +809,7 @@ local function webMarkDisconnected(err, backoff)
     WEB.ws = nil
     WEB.connected = false
     WEB.authenticated = false
+    WEB.authStartedAt = nil
 
     if backoff ~= false then
         WEB.nextConnectAt = nowMillis() + webReconnectDelayMs()
@@ -848,7 +855,7 @@ local function webSend(kind, payload)
 end
 
 local function webSendHello()
-    return webSend("hello", {
+    local ok, err = webSend("hello", {
         deviceId = CONFIG.web.deviceId,
         token = CONFIG.web.token,
         scriptVersion = CONFIG.web.scriptVersion,
@@ -867,6 +874,12 @@ local function webSendHello()
             },
         },
     })
+
+    if ok then
+        WEB.lastHelloSentAt = nowMillis()
+    end
+
+    return ok, err
 end
 
 local function webConnectIfNeeded()
@@ -891,6 +904,7 @@ local function webConnectIfNeeded()
         WEB.ws = wsOrErr
         WEB.connected = true
         WEB.authenticated = false
+        WEB.authStartedAt = now
         WEB.lastError = nil
         WEB.lastMessageAt = os.date("%H:%M:%S")
         WEB.nextConnectAt = 0
@@ -1045,7 +1059,10 @@ local function handleWebMessage(raw)
 
     WEB.lastMessageAt = os.date("%H:%M:%S")
 
-    if message.type == "hello_ack" then
+    if message.type == "server_ready" then
+        WEB.lastServerReadyAt = os.date("%H:%M:%S")
+    elseif message.type == "hello_ack" then
+        WEB.lastHelloAckAt = os.date("%H:%M:%S")
         WEB.authenticated = message.ok == true
         WEB.configVersion = message.configVersion
         if not WEB.authenticated then
@@ -1106,6 +1123,33 @@ local function webReceiveAvailable(waitSeconds)
     end
 end
 
+local function webRetryHelloIfNeeded()
+    if not WEB.ws or WEB.authenticated == true then return end
+
+    local retrySeconds = tonumber(CONFIG.web and CONFIG.web.helloRetrySeconds) or 5
+    local lastHelloSentAt = WEB.lastHelloSentAt or 0
+    if nowMillis() - lastHelloSentAt < retrySeconds * 1000 then return end
+
+    webSendHello()
+end
+
+local function webCheckAuthTimeout()
+    if not WEB.ws or WEB.authenticated == true or not WEB.authStartedAt then return end
+
+    local timeoutSeconds = tonumber(CONFIG.web and CONFIG.web.authTimeoutSeconds) or 15
+    if nowMillis() - WEB.authStartedAt < timeoutSeconds * 1000 then return end
+
+    local err = "auth timeout waiting for hello_ack"
+    if WEB.lastServerReadyAt then
+        err = err .. " after server_ready"
+    end
+
+    if WEB.ws and WEB.ws.close then
+        pcall(function() WEB.ws.close() end)
+    end
+    webMarkDisconnected(err, true)
+end
+
 local function webSendSnapshot(snapshot)
     if not snapshot or not CONFIG.web or CONFIG.web.sendSnapshots ~= true then return end
     if WEB.authenticated ~= true then return end
@@ -1130,6 +1174,8 @@ local function webStatus()
         connected = WEB.connected == true and WEB.ws ~= nil,
         authenticated = WEB.authenticated == true,
         lastError = WEB.lastError,
+        lastServerReadyAt = WEB.lastServerReadyAt,
+        lastHelloAckAt = WEB.lastHelloAckAt,
         lastMessageAt = WEB.lastMessageAt,
         lastSendAt = WEB.lastSendAt,
         lastSnapshotAt = WEB.lastSnapshotAt,
@@ -2590,6 +2636,9 @@ local function drawHeader(snapshot)
     if snapshot.web and snapshot.web.enabled then
         if snapshot.web.connected then
             webText = snapshot.web.authenticated and " | Web: auth" or " | Web: connected, waiting auth"
+            if not snapshot.web.authenticated and snapshot.web.lastServerReadyAt then
+                webText = webText .. " | Server ready " .. tostring(snapshot.web.lastServerReadyAt)
+            end
             if snapshot.web.lastSnapshotAt then
                 webText = webText .. " | Snapshot " .. tostring(snapshot.web.lastSnapshotAt)
             end
@@ -3417,6 +3466,8 @@ while true do
         sampleTpsFromTimer()
         webConnectIfNeeded()
         webReceiveAvailable(WEB.ws and WEB.authenticated ~= true and 0.25 or 0)
+        webRetryHelloIfNeeded()
+        webCheckAuthTimeout()
 		
 		local ok, snapshotOrErr = pcall(collectSnapshot)
 
