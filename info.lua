@@ -1075,6 +1075,8 @@ local function handleWebMessage(raw)
         ackCommand(message.commandId, ok and "ok" or "error", result)
     elseif message.type == "ping" then
         webSend("pong", { at = os.date("%H:%M:%S") })
+    elseif message.type == "error" then
+        WEB.lastError = tostring(message.message or "server error")
     end
 end
 

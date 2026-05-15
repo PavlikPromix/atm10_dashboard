@@ -949,7 +949,7 @@ function App() {
             return;
           }
 
-          if (message && (message.type === "snapshot" || message.type === "config" || message.type === "config_ack")) {
+          if (message && (message.type === "snapshot" || message.type === "device" || message.type === "config" || message.type === "config_ack" || message.type === "command_ack")) {
             void reload().catch(() => undefined);
           }
         };

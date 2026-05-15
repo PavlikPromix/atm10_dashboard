@@ -22,6 +22,7 @@ const env = {
   deviceToken: process.env.DEVICE_TOKEN ?? "change-me",
 };
 const LIVE_DEVICE_WINDOW_MS = 15_000;
+const DEVICE_TOUCH_THROTTLE_MS = 5_000;
 
 type ClientSocket = {
   send: (message: string) => void;
@@ -38,6 +39,8 @@ type DeviceConnection = {
 
 const deviceConnections = new Map<string, DeviceConnection>();
 const browserClients = new Set<ClientSocket>();
+const deviceLastTouchAt = new Map<string, number>();
+const resourceSyncInFlight = new Set<string>();
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -522,6 +525,31 @@ async function syncCraftPatterns(deviceId: string, snapshot: any, now: Date) {
   }
 }
 
+function isDeviceSocketOnline(deviceId: string) {
+  return deviceConnections.get(deviceId)?.authenticated === true;
+}
+
+function isDeviceRecentlySeen(device: { online: boolean; lastSeenAt: Date | string | null }, now: Date) {
+  return (
+    device.online &&
+    device.lastSeenAt !== null &&
+    now.getTime() - new Date(device.lastSeenAt).getTime() <= LIVE_DEVICE_WINDOW_MS
+  );
+}
+
+async function markDeviceSeen(deviceId: string, force = false) {
+  const nowMs = Date.now();
+  const previous = deviceLastTouchAt.get(deviceId) ?? 0;
+  if (!force && nowMs - previous < DEVICE_TOUCH_THROTTLE_MS) return;
+
+  deviceLastTouchAt.set(deviceId, nowMs);
+  await prisma.device.updateMany({
+    where: { id: deviceId },
+    data: { online: true, lastSeenAt: new Date(nowMs) },
+  });
+  broadcast("device", { deviceId, online: true });
+}
+
 async function persistResourceRows(deviceId: string, rows: NormalizedResource[], categoriesWithFullLists: Set<ResourceCategory>, now: Date) {
   const categories = [...new Set([...categoriesWithFullLists, ...rows.map((row) => row.category)])];
   if (!categories.length) return;
@@ -824,18 +852,17 @@ async function buildCraftPreview(deviceId: string, category: ResourceCategory, k
 async function persistSnapshot(deviceId: string, snapshot: any) {
   const normalizedSnapshot = normalizeSnapshot(snapshot);
   const now = new Date();
+  const publicSnapshot = stripHeavySnapshotFields(normalizedSnapshot);
 
   await prisma.device.update({
     where: { id: deviceId },
     data: { lastSeenAt: now, online: true },
   });
 
-  await persistResourcesFromSnapshot(deviceId, normalizedSnapshot, now);
-
   await prisma.snapshot.create({
     data: {
       deviceId,
-      payload: stripHeavySnapshotFields(normalizedSnapshot),
+      payload: publicSnapshot,
     },
   });
 
@@ -874,7 +901,15 @@ async function persistSnapshot(deviceId: string, snapshot: any) {
     }
   }
 
-  broadcast("snapshot", { deviceId, snapshot: stripHeavySnapshotFields(normalizedSnapshot) });
+  broadcast("snapshot", { deviceId, snapshot: publicSnapshot });
+
+  if (resourceSyncInFlight.has(deviceId)) return;
+  resourceSyncInFlight.add(deviceId);
+  try {
+    await persistResourcesFromSnapshot(deviceId, normalizedSnapshot, now);
+  } finally {
+    resourceSyncInFlight.delete(deviceId);
+  }
 }
 
 async function sendPendingCommands(deviceId: string) {
@@ -968,10 +1003,7 @@ async function main() {
         name: device.name,
         scriptVersion: device.scriptVersion,
         lastSeenAt: device.lastSeenAt,
-        online:
-          device.online &&
-          device.lastSeenAt !== null &&
-          now.getTime() - new Date(device.lastSeenAt).getTime() <= LIVE_DEVICE_WINDOW_MS,
+        online: isDeviceSocketOnline(device.id) || isDeviceRecentlySeen(device, now),
       })),
       config,
     };
@@ -1224,6 +1256,7 @@ async function main() {
 
     const closeDevice = async () => {
       deviceConnections.delete(deviceId);
+      deviceLastTouchAt.delete(deviceId);
       await prisma.device.updateMany({ where: { id: deviceId }, data: { online: false } });
       broadcast("device", { deviceId, online: false });
     };
@@ -1250,6 +1283,7 @@ async function main() {
           }
 
           deviceConnections.set(deviceId, { deviceId, socket, authenticated: true });
+          deviceLastTouchAt.set(deviceId, Date.now());
           await prisma.device.update({
             where: { id: deviceId },
             data: {
@@ -1273,6 +1307,8 @@ async function main() {
           sendJson(socket, { type: "error", message: "hello required" });
           return;
         }
+
+        await markDeviceSeen(deviceId);
 
         if (message.type === "snapshot") {
           await persistSnapshot(deviceId, message.snapshot);
